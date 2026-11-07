@@ -1,14 +1,14 @@
 bash -c 'if (( EUID == 0 )); then exec bash -s; fi; exec sudo env "SSH_CONNECTION=${SSH_CONNECTION:-}" "WGMAINT_ENDPOINT=${WGMAINT_ENDPOINT:-}" "WGMAINT_ADMIN_PUBLIC_KEY=${WGMAINT_ADMIN_PUBLIC_KEY:-}" "WGMAINT_APT_REGION=${WGMAINT_APT_REGION:-}" bash -s' <<'WGMAINT_DEPLOY'
 set -Eeuo pipefail
 umask 077
-trap 'printf "Deployment failed at line %s (exit %s).\n" "$LINENO" "$?" >&2' ERR
+trap 'printf "部署失败。出错行 %s，退出码 %s。\n" "$LINENO" "$?" >&2' ERR
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
-[[ $(uname -s) == Linux && -d /run/systemd/system ]] || die 'Requires Linux with systemd.'
+[[ $(uname -s) == Linux && -d /run/systemd/system ]] || die '请在使用 systemd 的 Linux 服务器上执行。'
 . /etc/os-release
-[[ $ID == debian || $ID == ubuntu ]] || die 'This installer supports Debian and Ubuntu.'
+[[ $ID == debian || $ID == ubuntu ]] || die '此脚本支持 Debian 和 Ubuntu。'
 exec 9>/run/lock/wgmaint-deploy.lock
-flock -n 9 || die 'Another deployment is running.'
+flock -n 9 || die '已有一个部署任务在运行。'
 
 state=/var/lib/wgmaint
 iface=wgmaint0
@@ -34,14 +34,14 @@ put() {
 
 check_null_device() {
     [[ -c /dev/null && $(stat -Lc '%t:%T' /dev/null) == 1:3 ]] ||
-        die '/dev/null is not the Linux null device (major 1, minor 3). Repair the VPS device before deploying.'
+        die '/dev/null 的设备类型或编号有误，应为字符设备 1:3。请先修复 VPS 的设备节点。'
     if [[ $(stat -Lc '%a' /dev/null) != 666 ]]; then
-        printf 'Restoring /dev/null permissions to 0666.\n' >&2
+        printf '正在将 /dev/null 的权限恢复为 0666。\n' >&2
         chmod 0666 /dev/null
     fi
     if getent passwd _apt >/dev/null; then
         runuser -u _apt -- sh -c ': </dev/null && : >/dev/null' ||
-            die 'The APT sandbox user cannot open /dev/null. Check VPS device permissions or restrictions.'
+            die 'APT 沙箱用户无法读写 /dev/null。请检查 VPS 的设备权限或访问限制。'
     fi
 }
 
@@ -72,7 +72,7 @@ case "$apt_region" in
         fi
         ;;
     cn|system) ;;
-    *) die 'WGMAINT_APT_REGION must be auto, cn or system.' ;;
+    *) die 'WGMAINT_APT_REGION 只接受 auto、cn 或 system。' ;;
 esac
 
 write_mirror_sources() {
@@ -100,9 +100,9 @@ write_mirror_sources() {
 install_from_cn_mirrors() (
     local codename=${VERSION_CODENAME:-} keyring mirror attempt apt_tmp
     local -a apt_options mirrors
-    [[ $codename =~ ^[a-z][a-z0-9]*$ ]] || die 'Missing distribution codename in /etc/os-release.'
+    [[ $codename =~ ^[a-z][a-z0-9]*$ ]] || die '无法从 /etc/os-release 读取发行版代号。'
     keyring=/usr/share/keyrings/$ID-archive-keyring.gpg
-    [[ -s $keyring ]] || die "Missing distribution archive keyring: $keyring"
+    [[ -s $keyring ]] || die "缺少发行版软件源签名密钥环 $keyring。"
     mirrors=(https://mirrors.aliyun.com https://mirrors.tuna.tsinghua.edu.cn)
     if [[ $ID == debian && $codename == bullseye ]]; then
         mirrors=(https://mirrors.aliyun.com https://repo.huaweicloud.com/repository)
@@ -136,15 +136,15 @@ install_from_cn_mirrors() (
             -o Acquire::AllowInsecureRepositories=false
             -o APT::Get::AllowUnauthenticated=false
         )
-        printf 'APT bootstrap mirror: %s (%s)\n' "$mirror" "$codename"
+        printf '正在使用 APT 镜像 %s（%s）。\n' "$mirror" "$codename"
         if apt-get "${apt_options[@]}" update </dev/null &&
             apt-get "${apt_options[@]}" --download-only -y --no-remove --no-install-recommends install "$@" </dev/null; then
             DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" --no-download -y --no-remove --no-install-recommends install "$@" </dev/null
             return
         fi
-        printf 'APT mirror failed: %s\n' "$mirror" >&2
+        printf 'APT 镜像访问或取包失败：%s\n' "$mirror" >&2
     done
-    die 'All China APT mirror attempts failed. See the APT errors above.'
+    die '国内 APT 镜像均未能完成取包，请查看上方的 APT 报错。'
 )
 
 check_null_device
@@ -173,15 +173,15 @@ install -d -m 0700 /etc/wireguard
 install -d -m 0755 /usr/local/lib/wgmaint "/etc/systemd/system/wg-quick@$iface.service.d"
 
 if [[ ! -f $settings ]]; then
-    [[ ! -e $conf ]] || die "Refusing to overwrite existing $conf."
+    [[ ! -e $conf ]] || die "配置文件 $conf 已存在。为避免覆盖，部署已停止。"
     if ip link show dev "$iface" >/dev/null 2>&1; then
-        die "Interface $iface already exists."
+        die "网络接口 $iface 已存在。"
     fi
     if nft list table inet wgmaint >/dev/null 2>&1; then
-        die 'An nftables table named wgmaint already exists.'
+        die 'nftables 中已存在名为 wgmaint 的规则表。'
     fi
     if [[ -n $(ss -H -lun "sport = :$wg_port") || -n $(ss -H -ltn "sport = :$join_port") ]]; then
-        die "Port conflict. Need UDP $wg_port and TCP $join_port."
+        die "端口冲突。部署需要 UDP $wg_port 和 TCP $join_port。"
     fi
     discovered=$(/usr/bin/python3 - "${WGMAINT_ENDPOINT:-}" "${SSH_CONNECTION:-}" "$aliyun_ecs" <<'DISCOVER'
 import ipaddress
@@ -233,18 +233,18 @@ if not endpoint:
     elif aliyun_ecs == "true":
         endpoint = aliyun_public_ip()
     if not endpoint:
-        sys.exit("Cannot infer the public IPv4 endpoint. Prefix the deployment command with WGMAINT_ENDPOINT=PUBLIC_IP_OR_DNS.")
+        sys.exit("无法自动识别公网 IPv4。请通过 WGMAINT_ENDPOINT 指定公网 IP 或域名后重试。")
 try:
     ip = ipaddress.IPv4Address(endpoint)
 except ValueError:
     labels = endpoint.split(".")
     if (len(endpoint) > 253 or len(labels) < 2 or not any(c.isalpha() for c in labels[-1])
         or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in labels)):
-        sys.exit("WGMAINT_ENDPOINT must be an IPv4 address or DNS name.")
+        sys.exit("WGMAINT_ENDPOINT 需要填写 IPv4 地址或域名。")
     san = "DNS:" + endpoint
 else:
     if not ip.is_global or ip.is_multicast:
-        sys.exit("WGMAINT_ENDPOINT must be a public unicast IPv4 address.")
+        sys.exit("WGMAINT_ENDPOINT 需要填写公网单播 IPv4 地址。")
     san = "IP:" + endpoint
 routes = [
     ipaddress.IPv4Network(row["dst"], strict=False)
@@ -257,7 +257,7 @@ for prefix in ("10.203.249", "10.239.246", "172.30.231", "192.168.237"):
         print(json.dumps({"endpoint": endpoint, "san": san, "network": str(net)}))
         break
 else:
-    sys.exit("All candidate tunnel subnets overlap existing VPS routes.")
+    sys.exit("候选隧道网段均与 VPS 的现有路由冲突。")
 DISCOVER
     )
     put "$settings" 0640 wgmaint <<<"$discovered"
@@ -274,10 +274,10 @@ for value in (s["endpoint"], s["san"], str(n), n[1], n[2]):
     print(value)
 SETTINGS
 )
-[[ ${#values[@]} == 5 ]] || die 'Could not read deployment settings.'
+[[ ${#values[@]} == 5 ]] || die '无法读取部署配置。'
 endpoint=${values[0]} san=${values[1]} network=${values[2]} vps_ip=${values[3]} admin_ip=${values[4]}
 if [[ -n ${WGMAINT_ENDPOINT:-} && $endpoint != "$WGMAINT_ENDPOINT" ]]; then
-    die "Existing deployment uses $endpoint."
+    die "现有部署使用的公网入口是 $endpoint。"
 fi
 
 if [[ ! -s $state/server.key ]]; then
@@ -297,9 +297,9 @@ key = sys.argv[1]
 try:
     raw = base64.b64decode(key, validate=True)
 except ValueError:
-    sys.exit("Invalid WGMAINT_ADMIN_PUBLIC_KEY.")
+    sys.exit("WGMAINT_ADMIN_PUBLIC_KEY 不是有效的 WireGuard 公钥。")
 if len(raw) != 32 or not any(raw) or base64.b64encode(raw).decode() != key:
-    sys.exit("Invalid WGMAINT_ADMIN_PUBLIC_KEY.")
+    sys.exit("WGMAINT_ADMIN_PUBLIC_KEY 不是有效的 WireGuard 公钥。")
 print(key)
 ADMINKEY
         )
@@ -314,9 +314,9 @@ ADMINKEY
     fi
 fi
 if [[ -n ${WGMAINT_ADMIN_PUBLIC_KEY:-} && $(cat "$state/admin.pub") != "$WGMAINT_ADMIN_PUBLIC_KEY" ]]; then
-    die 'Existing deployment has a different admin public key.'
+    die '提供的管理端公钥与现有部署记录不一致。'
 fi
-[[ $(cat "$state/admin.pub") != "$(cat "$state/server.pub")" ]] || die 'Admin and server public keys must differ.'
+[[ $(cat "$state/admin.pub") != "$(cat "$state/server.pub")" ]] || die '管理端和服务器必须使用不同的 WireGuard 公钥。'
 
 if [[ ! -s $state/join.crt || ! -s $state/join.key ]]; then
     cert_tmp=$(mktemp -d "$state/cert.XXXXXX")
@@ -544,7 +544,7 @@ def application(environ, start_response):
     except (ValueError, UnicodeError):
         status, result = "400 Bad Request", {"error": "invalid JSON"}
     except (OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError) as exc:
-        print(f"Registry error: {type(exc).__name__}", file=sys.stderr)
+        print(f"接入登记服务出错：{type(exc).__name__}", file=sys.stderr)
         status, result = "503 Service Unavailable", {"error": "retry later"}
 
     body = json.dumps(result).encode("utf-8") + b"\n"
@@ -561,12 +561,12 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["invite"]:
         invite()
     else:
-        sys.exit("usage: registry.py restore|invite")
+        sys.exit("用法：registry.py restore|invite")
 REGISTRY
 
 put /etc/systemd/system/wgmaint-firewall.service 0644 root <<FIREWALL_UNIT
 [Unit]
-Description=WireGuard maintenance firewall
+Description=WireGuard 维护网络防火墙
 After=nftables.service ufw.service firewalld.service
 
 [Service]
@@ -583,7 +583,7 @@ WG_UNIT
 
 put /etc/systemd/system/wgmaint-registry.service 0644 root <<REGISTRY_UNIT
 [Unit]
-Description=WireGuard maintenance peer enrollment
+Description=WireGuard 客户接入登记服务
 BindsTo=wg-quick@$iface.service
 After=wg-quick@$iface.service
 PartOf=wg-quick@$iface.service
@@ -630,19 +630,20 @@ for (( attempt=0; attempt<15; attempt++ )); do
     fi
     sleep 1
 done
-(( ready )) || die 'Enrollment check failed. Inspect: journalctl -u wgmaint-registry.service -n 50'
-[[ $(wg show "$iface" listen-port) == "$wg_port" ]] || die 'WireGuard listen-port check failed.'
-[[ $(wg show "$iface" public-key) == "$(cat "$state/server.pub")" ]] || die 'WireGuard public-key check failed.'
+(( ready )) || die '接入登记服务本机检查失败。运行 journalctl -u wgmaint-registry.service -n 50 查看日志。'
+[[ $(wg show "$iface" listen-port) == "$wg_port" ]] || die 'WireGuard 监听端口检查失败。'
+[[ $(wg show "$iface" public-key) == "$(cat "$state/server.pub")" ]] || die 'WireGuard 服务器公钥检查失败。'
 
 invitation=$(runuser -u wgmaint -- /usr/bin/python3 /usr/local/lib/wgmaint/registry.py invite)
 put "$state/latest-invite.json" 0600 root <<<"$invitation"
-printf '\nWireGuard: %s:%s (UDP)\nEnrollment: https://%s:%s (TCP)\n' "$endpoint" "$wg_port" "$endpoint" "$join_port"
-printf 'VPS tunnel IP: %s\nAdmin tunnel IP: %s\n' "$vps_ip" "$admin_ip"
+printf '\n部署完成，服务已通过本机检查。\n'
+printf 'WireGuard 公网入口：%s:%s（UDP）\n客户接入地址：https://%s:%s（TCP）\n' "$endpoint" "$wg_port" "$endpoint" "$join_port"
+printf 'VPS 隧道 IP：%s\n管理端隧道 IP：%s\n' "$vps_ip" "$admin_ip"
 if [[ -f $state/admin.conf ]]; then
-    printf 'Mac WireGuard profile (contains private key): %s/admin.conf\n' "$state"
+    printf 'Mac 的 WireGuard 配置（含私钥）：%s/admin.conf\n' "$state"
 else
-    printf 'Server WireGuard public key: %s\nAdmin AllowedIPs: %s\n' "$(cat "$state/server.pub")" "$network"
+    printf '服务器 WireGuard 公钥：%s\n管理端 AllowedIPs：%s\n' "$(cat "$state/server.pub")" "$network"
 fi
-printf 'Latest invitation (expires in 15 minutes): %s/latest-invite.json\n' "$state"
-printf 'Ensure the VPS host/cloud firewall allows inbound UDP %s and TCP %s, and admin-to-client forwarding on %s.\n' "$wg_port" "$join_port" "$iface"
+printf '最新客户接入邀请（15 分钟内有效）：%s/latest-invite.json\n' "$state"
+printf '请确认 VPS 防火墙和云安全组放行入站 UDP %s、TCP %s，并允许管理端通过 %s 转发 SSH 到客户机。\n' "$wg_port" "$join_port" "$iface"
 WGMAINT_DEPLOY
