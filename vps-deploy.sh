@@ -1,4 +1,4 @@
-bash -c 'if (( EUID == 0 )); then exec bash -s; fi; exec sudo env "SSH_CONNECTION=${SSH_CONNECTION:-}" "WGMAINT_ENDPOINT=${WGMAINT_ENDPOINT:-}" "WGMAINT_ADMIN_PUBLIC_KEY=${WGMAINT_ADMIN_PUBLIC_KEY:-}" bash -s' <<'WGMAINT_DEPLOY'
+bash -c 'if (( EUID == 0 )); then exec bash -s; fi; exec sudo env "SSH_CONNECTION=${SSH_CONNECTION:-}" "WGMAINT_ENDPOINT=${WGMAINT_ENDPOINT:-}" "WGMAINT_ADMIN_PUBLIC_KEY=${WGMAINT_ADMIN_PUBLIC_KEY:-}" "WGMAINT_APT_REGION=${WGMAINT_APT_REGION:-}" bash -s' <<'WGMAINT_DEPLOY'
 set -Eeuo pipefail
 umask 077
 trap 'printf "Deployment failed at line %s (exit %s).\n" "$LINENO" "$?" >&2' ERR
@@ -32,6 +32,122 @@ put() {
     fi
 }
 
+check_null_device() {
+    [[ -c /dev/null && $(stat -Lc '%t:%T' /dev/null) == 1:3 ]] ||
+        die '/dev/null is not the Linux null device (major 1, minor 3). Repair the VPS device before deploying.'
+    if [[ $(stat -Lc '%a' /dev/null) != 666 ]]; then
+        printf 'Restoring /dev/null permissions to 0666.\n' >&2
+        chmod 0666 /dev/null
+    fi
+    if getent passwd _apt >/dev/null; then
+        runuser -u _apt -- sh -c ': </dev/null && : >/dev/null' ||
+            die 'The APT sandbox user cannot open /dev/null. Check VPS device permissions or restrictions.'
+    fi
+}
+
+source_files=()
+for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    if [[ -r $source_file ]]; then
+        source_files+=("$source_file")
+    fi
+done
+has_mirror() {
+    (( ${#source_files[@]} )) &&
+        grep -Eiq "^[[:space:]]*(deb[[:space:]]|URIs:).*https?://($1)/" "${source_files[@]}"
+}
+
+aliyun_ecs=false
+if grep -iq 'Alibaba Cloud' /sys/class/dmi/id/sys_vendor 2>/dev/null ||
+    has_mirror 'mirrors\.(cloud\.)?aliyuncs\.com'; then
+    aliyun_ecs=true
+fi
+
+apt_region=${WGMAINT_APT_REGION:-auto}
+case "$apt_region" in
+    auto)
+        if has_mirror 'mirrors\.aliyun\.com|mirrors\.(cloud\.)?aliyuncs\.com|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.ustc\.edu\.cn|mirrors\.huaweicloud\.com|mirrors\.cloud\.tencent\.com|mirrors\.tencent\.com'; then
+            apt_region=cn
+        else
+            apt_region=system
+        fi
+        ;;
+    cn|system) ;;
+    *) die 'WGMAINT_APT_REGION must be auto, cn or system.' ;;
+esac
+
+write_mirror_sources() {
+    local mirror=$1 codename=$2 keyring=$3 archive
+    if [[ $ID == debian ]]; then
+        if [[ $codename == bullseye ]]; then
+            # Only the frozen Bullseye security archive needs an exception to metadata expiry.
+            printf 'deb [signed-by=%s] %s/debian-archive/debian/ %s main\n' "$keyring" "$mirror" "$codename"
+            printf 'deb [signed-by=%s check-valid-until=no] %s/debian-archive/debian-security/ %s-security main\n' "$keyring" "$mirror" "$codename"
+        else
+            printf 'deb [signed-by=%s] %s/debian/ %s main\n' "$keyring" "$mirror" "$codename"
+            printf 'deb [signed-by=%s] %s/debian-security/ %s-security main\n' "$keyring" "$mirror" "$codename"
+        fi
+    else
+        case "$(dpkg --print-architecture)" in
+            amd64|i386) archive=ubuntu ;;
+            *) archive=ubuntu-ports ;;
+        esac
+        for suite in "$codename" "$codename-updates" "$codename-security"; do
+            printf 'deb [signed-by=%s] %s/%s/ %s main universe\n' "$keyring" "$mirror" "$archive" "$suite"
+        done
+    fi
+}
+
+install_from_cn_mirrors() (
+    local codename=${VERSION_CODENAME:-} keyring mirror attempt apt_tmp
+    local -a apt_options mirrors
+    [[ $codename =~ ^[a-z][a-z0-9]*$ ]] || die 'Missing distribution codename in /etc/os-release.'
+    keyring=/usr/share/keyrings/$ID-archive-keyring.gpg
+    [[ -s $keyring ]] || die "Missing distribution archive keyring: $keyring"
+    mirrors=(https://mirrors.aliyun.com https://mirrors.tuna.tsinghua.edu.cn)
+    if [[ $ID == debian && $codename == bullseye ]]; then
+        mirrors=(https://mirrors.aliyun.com https://repo.huaweicloud.com/repository)
+    fi
+    if $aliyun_ecs && has_mirror 'mirrors\.cloud\.aliyuncs\.com'; then
+        mirrors=(http://mirrors.cloud.aliyuncs.com "${mirrors[@]}")
+    fi
+
+    apt_tmp=$(mktemp -d /tmp/wgmaint-apt.XXXXXX)
+    trap 'rm -rf -- "$apt_tmp"' EXIT
+    chmod 0755 "$apt_tmp"
+    attempt=0
+    for mirror in "${mirrors[@]}"; do
+        attempt=$((attempt + 1))
+        local mirror_dir=$apt_tmp/$attempt
+        install -d -m 0755 "$mirror_dir" "$mirror_dir/lists" "$mirror_dir/archives"
+        write_mirror_sources "$mirror" "$codename" "$keyring" >"$mirror_dir/sources.list"
+        chmod 0644 "$mirror_dir/sources.list"
+        apt_options=(
+            -o "Dir::Etc::sourcelist=$mirror_dir/sources.list"
+            -o Dir::Etc::sourceparts=-
+            -o "Dir::State::lists=$mirror_dir/lists"
+            -o "Dir::Cache::archives=$mirror_dir/archives"
+            -o APT::Update::Error-Mode=any
+            -o Acquire::Languages=none
+            -o Acquire::Retries=1
+            -o Acquire::ForceIPv4=true
+            -o Acquire::http::Timeout=8
+            -o Acquire::https::Timeout=8
+            -o Acquire::http::Pipeline-Depth=0
+            -o Acquire::AllowInsecureRepositories=false
+            -o APT::Get::AllowUnauthenticated=false
+        )
+        printf 'APT bootstrap mirror: %s (%s)\n' "$mirror" "$codename"
+        if apt-get "${apt_options[@]}" update </dev/null &&
+            apt-get "${apt_options[@]}" --download-only -y --no-remove --no-install-recommends install "$@" </dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" --no-download -y --no-remove --no-install-recommends install "$@" </dev/null
+            return
+        fi
+        printf 'APT mirror failed: %s\n' "$mirror" >&2
+    done
+    die 'All China APT mirror attempts failed. See the APT errors above.'
+)
+
+check_null_device
 packages=(wireguard-tools nftables iproute2 openssl curl python3 gunicorn)
 missing=()
 for package in "${packages[@]}"; do
@@ -40,8 +156,12 @@ for package in "${packages[@]}"; do
     fi
 done
 if (( ${#missing[@]} )); then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+    if [[ $apt_region == cn ]]; then
+        install_from_cn_mirrors "${missing[@]}"
+    else
+        apt-get update </dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" </dev/null
+    fi
 fi
 
 if ! getent passwd wgmaint >/dev/null; then
@@ -63,14 +183,41 @@ if [[ ! -f $settings ]]; then
     if [[ -n $(ss -H -lun "sport = :$wg_port") || -n $(ss -H -ltn "sport = :$join_port") ]]; then
         die "Port conflict. Need UDP $wg_port and TCP $join_port."
     fi
-    discovered=$(/usr/bin/python3 - "${WGMAINT_ENDPOINT:-}" "${SSH_CONNECTION:-}" <<'DISCOVER'
+    discovered=$(/usr/bin/python3 - "${WGMAINT_ENDPOINT:-}" "${SSH_CONNECTION:-}" "$aliyun_ecs" <<'DISCOVER'
 import ipaddress
 import json
 import re
 import subprocess
 import sys
 
-endpoint, ssh = sys.argv[1:]
+def aliyun_public_ip():
+    root = "http://100.100.100.200/latest"
+    curl = ["curl", "-q", "-fsS", "--noproxy", "*", "--connect-timeout", "1",
+            "--max-time", "2", "--max-filesize", "1024"]
+    try:
+        token = subprocess.check_output(
+            [*curl, "-X", "PUT", "-H", "X-aliyun-ecs-metadata-token-ttl-seconds: 60",
+             root + "/api/token"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return ""
+    if not token or not re.fullmatch(r"[!-~]+", token):
+        return ""
+    for name in ("eipv4", "public-ipv4"):
+        try:
+            response = subprocess.check_output(
+                [*curl, "-H", "@-", root + "/meta-data/" + name], text=True,
+                input="X-aliyun-ecs-metadata-token: " + token + "\n", stderr=subprocess.DEVNULL
+            ).strip()
+            ip = ipaddress.IPv4Address(response)
+            if ip.is_global and not ip.is_multicast:
+                return str(ip)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            continue
+    return ""
+
+
+endpoint, ssh, aliyun_ecs = sys.argv[1:]
 if not endpoint:
     addresses = {
         ipaddress.IPv4Address(info["local"])
@@ -83,7 +230,9 @@ if not endpoint:
         endpoint = fields[2]
     elif len(public) == 1:
         endpoint = str(next(iter(public)))
-    else:
+    elif aliyun_ecs == "true":
+        endpoint = aliyun_public_ip()
+    if not endpoint:
         sys.exit("Cannot infer the public IPv4 endpoint. Prefix the deployment command with WGMAINT_ENDPOINT=PUBLIC_IP_OR_DNS.")
 try:
     ip = ipaddress.IPv4Address(endpoint)
@@ -185,8 +334,8 @@ put "$conf" 0600 root <<WGCONF
 Address = $vps_ip/24
 ListenPort = $wg_port
 PrivateKey = $(cat "$state/server.key")
-PostUp = /usr/sbin/sysctl -qw net.ipv4.conf.%i.forwarding=1
-PostUp = /usr/sbin/sysctl -qw net.ipv4.conf.%i.send_redirects=0
+PostUp = /sbin/sysctl -qw net.ipv4.conf.%i.forwarding=1
+PostUp = /sbin/sysctl -qw net.ipv4.conf.%i.send_redirects=0
 
 [Peer]
 PublicKey = $(cat "$state/admin.pub")
