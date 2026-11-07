@@ -9,7 +9,6 @@ state=/var/lib/wgmaint
 dropin=/etc/systemd/system/$service.d/short-join.conf
 module=$app/registry_windows.py
 bootstrap=$app/customer-join-windows.ps1
-package=$app/wireguard-amd64.msi
 firewall=$state/firewall.nft
 systemctl is-active --quiet "$service" ||
     die '找不到正在运行的维护登记服务，请在已部署的维护 VPS 上执行。'
@@ -24,7 +23,7 @@ mapfile -t launchers < <(sed -n 's/^ExecStart=\(.*\/gunicorn .* \)registry:appli
 
 work=$(mktemp -d)
 changed=false
-files=("$module" "$bootstrap" "$package" "$dropin" "$firewall")
+files=("$module" "$bootstrap" "$dropin" "$firewall")
 rollback() {
     local status=$? i
     trap - EXIT
@@ -59,28 +58,17 @@ awk '
 ' "$firewall" >"$work/firewall.nft" || die '维护防火墙规则与预期不符，升级已停止。'
 /usr/sbin/nft -c -f "$work/firewall.nft" || die '维护防火墙规则检查失败。'
 
-printf '正在准备 Windows WireGuard 安装包。\n'
-expected=7bfed60ad61b785c914b38b61555a975488e1d3ec472dbfb2fcdf498fca75242
-if [[ -f $package ]] && printf '%s  %s\n' "$expected" "$package" | sha256sum -c --status; then
-    cp -- "$package" "$work/wireguard-amd64.msi"
-else
-    curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time 60 --retry 2 \
-        --output "$work/wireguard-amd64.msi" \
-        'https://download.wireguard.com/windows-client/wireguard-amd64-1.1.1.msi' ||
-        die 'VPS 未能从 WireGuard 官网下载安装包，请检查 VPS 到 download.wireguard.com 的连接。'
-fi
-printf '%s  %s\n' "$expected" "$work/wireguard-amd64.msi" | sha256sum -c --status ||
-    die 'WireGuard 安装包 SHA-256 校验失败。'
-
 cat >"$work/registry_windows.py" <<'WGMAINT_WINDOWS_PY'
 import base64
 from contextlib import closing
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 
 from registry import STATE, application as registry_app, config, db_connect, digest
@@ -90,7 +78,11 @@ if Path(__file__).with_name("registry_download.py").is_file():
 
 MARKER = b"WGMAINT_JOIN_DATA_PLACEHOLDER"
 TEMPLATE = Path(__file__).with_name("customer-join-windows.ps1").read_bytes()
-PACKAGES = {"wg": Path(__file__).with_name("wireguard-amd64.msi")}
+PACKAGE_NAME = "wireguard-amd64.msi"
+PACKAGE_HASH = "7bfed60ad61b785c914b38b61555a975488e1d3ec472dbfb2fcdf498fca75242"
+PACKAGE_SIZE = 3293184
+PACKAGE_CACHE = STATE / "db" / PACKAGE_NAME
+LEGACY_PACKAGE = Path(__file__).with_name(PACKAGE_NAME)
 if TEMPLATE.count(MARKER) != 1:
     raise RuntimeError("invalid Windows bootstrap template")
 
@@ -161,6 +153,46 @@ def register_code(environ, start_response):
     return response(start_response, "200 OK", code.encode("ascii"))
 
 
+def available_package():
+    if PACKAGE_CACHE.is_file():
+        return PACKAGE_CACHE
+    if LEGACY_PACKAGE.is_file():
+        return LEGACY_PACKAGE
+    return None
+
+
+def upload_package(environ, start_response):
+    auth = re.fullmatch(r"Bearer ([A-Za-z0-9_-]{43})", environ.get("HTTP_AUTHORIZATION", ""))
+    if not auth:
+        return response(start_response, "403 Forbidden")
+    with closing(db_connect()) as db:
+        row = db.execute(
+            "SELECT expires, public_key FROM invitations WHERE digest = ?", (digest(auth[1]),)
+        ).fetchone()
+    if not row or row[0] <= time.time() or row[1] is not None:
+        return response(start_response, "403 Forbidden")
+    if int(environ.get("CONTENT_LENGTH") or 0) != PACKAGE_SIZE:
+        return response(start_response, "400 Bad Request")
+    fd, temporary = tempfile.mkstemp(dir=PACKAGE_CACHE.parent, prefix=".wireguard-")
+    try:
+        checksum = hashlib.sha256()
+        remaining = PACKAGE_SIZE
+        with os.fdopen(fd, "wb") as output:
+            while remaining:
+                chunk = environ["wsgi.input"].read(min(65536, remaining))
+                if not chunk:
+                    return response(start_response, "400 Bad Request")
+                checksum.update(chunk)
+                output.write(chunk)
+                remaining -= len(chunk)
+        if checksum.hexdigest() != PACKAGE_HASH:
+            return response(start_response, "400 Bad Request")
+        os.replace(temporary, PACKAGE_CACHE)
+        return response(start_response, "200 OK")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def download(code, package, environ, start_response):
     token = enrollment_token(code)
     with closing(db_connect()) as db:
@@ -173,7 +205,9 @@ def download(code, package, environ, start_response):
     if not row or row[0] <= time.time():
         return response(start_response, "403 Forbidden")
     if package:
-        path = PACKAGES[package]
+        path = available_package()
+        if path is None:
+            return response(start_response, "503 Service Unavailable")
         handle = path.open("rb")
         start_response("200 OK", [
             ("Content-Type", "application/octet-stream"),
@@ -202,6 +236,12 @@ class FileChunks:
 def application(environ, start_response):
     path, method = environ["PATH_INFO"], environ["REQUEST_METHOD"]
     try:
+        if path == "/v1/windows-package":
+            if method == "HEAD":
+                return response(start_response, "200 OK" if available_package() else "204 No Content")
+            if method == "POST":
+                return upload_package(environ, start_response)
+            return response(start_response, "405 Method Not Allowed")
         if path == "/v1/windows-code":
             if method == "HEAD":
                 return response(start_response, "200 OK")
@@ -498,7 +538,6 @@ put() {
 changed=true
 put "$work/registry_windows.py" "$module"
 put "$work/customer-join-windows.ps1" "$bootstrap"
-put "$work/wireguard-amd64.msi" "$package"
 put "$work/short-join.conf" "$dropin"
 install -m 0600 "$work/firewall.nft" "$firewall.wgmaint-new"
 mv -f -- "$firewall.wgmaint-new" "$firewall"
