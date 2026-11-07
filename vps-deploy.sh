@@ -667,7 +667,7 @@ $M_SSH = '5q2j5Zyo6YWN572uIFNTSC4uLg=='
 $M_OK = '5o6l5YWl5oiQ5Yqf77yB5Zyo57u05oqkIE1hYyDkuIrmiafooYzvvJo='
 $M_REBOOT = '5a6J6KOF6ZyA6KaB6YeN5ZCv44CC6K+36YeN5ZCv55S16ISR5ZCO6YeN5paw57KY6LS05ZCM5LiA5p2h5ZG95Luk44CC'
 $M_HANDSHAKE = 'V2lyZUd1YXJkIOacquWujOaIkOaPoeaJi++8jOivt+ajgOafpeWuouaIt+acuue9kee7nOWQjumHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
-$M_SSH_FAIL = 'T3BlblNTSCDmnI3liqHlmajlronoo4XlpLHotKXjgILor7fliLDorr7nva4t5bqU55SoLeWPr+mAieWKn+iDveaJi+WKqOWuieijhSBPcGVuU1NIIOacjeWKoeWZqO+8jOWGjeeUqOWQjOS4gOadoeWRveS7pOmHjeivleOAgg=='
+$M_SSH_FAIL = 'T3BlblNTSCDmnI3liqHlmajlkK/liqjlpLHotKXjgII='
 $M_FAIL = '5o6l5YWl5aSx6LSl44CC'
 $M_ACCOUNT = '57u05oqk6LSm5Y+35bey5a2Y5Zyo5L2G5LiN5Y+X5pys5bel5YW3566h55CG77yM5bey5YGc5q2i44CC'
 $M_MSI_BAD = 'V2lyZUd1YXJkIOWuieijheWMheagoemqjOWksei0pe+8jOivt+mHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
@@ -895,30 +895,61 @@ UseDNS no
     & $sshd -t -f $sshdConfig
     if ($LASTEXITCODE -ne 0) { throw (T $M_SSH_FAIL) }
 
-    $stage = 'task'
+    $stage = 'ssh-service'
+    $logFile = Join-Path $root 'sshd.log'
+    $sshData = Join-Path $env:ProgramData 'ssh'
+    if (-not (Test-Path -LiteralPath $sshData)) { New-Item -ItemType Directory -Path $sshData | Out-Null }
     $taskName = 'Wgmaint OpenSSH'
     $oldTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($oldTask) {
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
     }
+    $svcName = 'WgmaintSSH'
+    $oldService = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($oldService) {
+        & sc.exe stop $svcName | Out-Null
+        Start-Sleep -Seconds 1
+        & sc.exe delete $svcName | Out-Null
+        Start-Sleep -Seconds 1
+    }
     $oldRule = Get-NetFirewallRule -Name 'Wgmaint-SSH' -ErrorAction SilentlyContinue
     if ($oldRule) { $oldRule | Remove-NetFirewallRule }
     New-NetFirewallRule -Name 'Wgmaint-SSH' -DisplayName 'Wgmaint SSH' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -LocalAddress $address -RemoteAddress $values['admin_ip'] -Program $sshd | Out-Null
-    $logFile = Join-Path $root 'sshd.log'
-    $action = New-ScheduledTaskAction -Execute $sshd -Argument ('-D -f "' + $sshdConfig + '" -E "' + $logFile + '"')
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $trigger.Delay = 'PT30S'
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
-    Start-ScheduledTask -TaskName $taskName
-    $listening = $false
-    foreach ($attempt in 1..20) {
-        if (Get-NetTCPConnection -State Listen -LocalAddress $address -LocalPort $port -ErrorAction SilentlyContinue) { $listening = $true; break }
-        Start-Sleep -Seconds 1
+    $sshdArgs = '-D -f "' + $sshdConfig + '" -E "' + $logFile + '"'
+    $started = $false
+    try {
+        $action = New-ScheduledTaskAction -Execute $sshd -Argument $sshdArgs
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $trigger.Delay = 'PT30S'
+        $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $taskSettings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        foreach ($attempt in 1..15) {
+            if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) { $started = $true; break }
+            Start-Sleep -Seconds 1
+        }
+    } catch {
     }
-    if (-not $listening) { throw (T $M_SSH_FAIL) }
-
+    if (-not $started) {
+        & sc.exe create $svcName binPath= ('"' + $sshd + '" ' + $sshdArgs) start= auto obj= LocalSystem DisplayName= 'Wgmaint SSH' | Out-Null
+        & sc.exe start $svcName | Out-Null
+        foreach ($attempt in 1..15) {
+            if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) { $started = $true; break }
+            Start-Sleep -Seconds 1
+        }
+    }
+    if (-not $started) {
+        $detail = ''
+        if (Test-Path -LiteralPath $logFile) { $detail = $detail + (Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue) }
+        $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo
+        if ($taskInfo) { $detail = $detail + ' task=' + $taskInfo.LastTaskResult }
+        $procs = Get-Process -Name sshd -ErrorAction SilentlyContinue
+        if ($procs) { $detail = $detail + ' sshd_pid=' + ($procs.Id -join ',') }
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc) { $detail = $detail + ' service=' + $svc.Status }
+        throw ((T $M_SSH_FAIL) + $detail)
+    }
     Write-Host (T $M_OK) -ForegroundColor Green
     Write-Host ('ssh -p ' + $port + ' ' + $account + '@' + $address)
     Report ('ok ' + $address)
