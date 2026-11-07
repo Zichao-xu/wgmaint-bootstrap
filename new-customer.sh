@@ -1,5 +1,5 @@
 #!/bin/bash
-# 新客户接入：向 VPS 签发一次性短码，生成客户机命令并复制到剪贴板。
+# 新客户接入：向维护 VPS 签发一次性短码，生成客户机命令并复制到剪贴板。
 # MVP：只做 Windows 客户机；macOS 客户机入口下一轮补上。
 set -Eeo pipefail
 export LC_ALL=en_US.UTF-8
@@ -102,21 +102,37 @@ CFG_ADMIN_IP=""
 CFG_ADMIN_KEY=""
 CFG_ADMIN_TOKEN=""
 
-load_config() {
+read_field() {
+    printf '%s' "$1" | cut -d= -f2-
+}
+
+parse_config_line() {
     local key value
+    key=$(printf '%s' "$1" | cut -d= -f1)
+    value=$(read_field "$1")
+    case $key in
+        join) CFG_JOIN=$value ;;
+        endpoint) CFG_ENDPOINT=$value ;;
+        network) CFG_NETWORK=$value ;;
+        server_public_key) CFG_SERVER_PUB=$value ;;
+        admin_ip) CFG_ADMIN_IP=$value ;;
+        admin_private_key) CFG_ADMIN_KEY=$value ;;
+        admin_token) CFG_ADMIN_TOKEN=$value ;;
+    esac
+}
+
+load_config() {
+    local line
     [ -f "$config" ] || return 1
-    while IFS='=' read -r key value; do
-        case $key in
-            join) CFG_JOIN=$value ;;
-            endpoint) CFG_ENDPOINT=$value ;;
-            network) CFG_NETWORK=$value ;;
-            server_public_key) CFG_SERVER_PUB=$value ;;
-            admin_ip) CFG_ADMIN_IP=$value ;;
-            admin_private_key) CFG_ADMIN_KEY=$value ;;
-            admin_token) CFG_ADMIN_TOKEN=$value ;;
-        esac
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        parse_config_line "$line"
     done <"$config"
-    [ -n "$CFG_JOIN" ] && [ -n "$CFG_ADMIN_TOKEN" ]
+    [ -n "$CFG_JOIN" ] || return 1
+    printf '%s' "$CFG_ADMIN_KEY" | grep -Eq '^[A-Za-z0-9+/]{43}=$' || return 1
+    printf '%s' "$CFG_SERVER_PUB" | grep -Eq '^[A-Za-z0-9+/]{43}=$' || return 1
+    printf '%s' "$CFG_ADMIN_TOKEN" | grep -Eq '^[A-Za-z0-9_-]{43}$' || return 1
+    return 0
 }
 
 save_config() {
@@ -135,30 +151,7 @@ EOF
     chmod 600 "$config"
 }
 
-apply_registration() {
-    local encoded payload key value
-    encoded=$(printf '%s' "$1" | cut -c5-)
-    if ! payload=$(printf '%s' "$encoded" | base64 -D 2>/dev/null); then
-        payload=$(printf '%s' "$encoded" | base64 -d)
-    fi
-    [ -n "$payload" ] || die "登记码解码失败。"
-    while IFS='=' read -r key value; do
-        case $key in
-            join) CFG_JOIN=$value ;;
-            endpoint) CFG_ENDPOINT=$value ;;
-            network) CFG_NETWORK=$value ;;
-            server_public_key) CFG_SERVER_PUB=$value ;;
-            admin_ip) CFG_ADMIN_IP=$value ;;
-            admin_private_key) CFG_ADMIN_KEY=$value ;;
-            admin_token) CFG_ADMIN_TOKEN=$value ;;
-        esac
-    done <<<"$payload"
-    [ -n "$CFG_JOIN" ] && [ -n "$CFG_ADMIN_TOKEN" ] && [ -n "$CFG_ADMIN_KEY" ] ||
-        die "登记码内容不完整。"
-    case $CFG_JOIN in
-        http://*) ;;
-        *) die "登记码里的接入地址无效。" ;;
-    esac
+write_admin_conf() {
     mkdir -p "$dir"
     chmod 700 "$CONFIG_DIR" "$dir"
     umask 077
@@ -174,6 +167,28 @@ AllowedIPs = $CFG_NETWORK
 PersistentKeepalive = 25
 EOF
     chmod 600 "$admin_conf"
+}
+
+apply_registration() {
+    local encoded payload line
+    encoded=$(printf '%s' "$1" | cut -c5-)
+    if ! payload=$(printf '%s' "$encoded" | base64 -D 2>/dev/null); then
+        payload=$(printf '%s' "$encoded" | base64 -d)
+    fi
+    [ -n "$payload" ] || die "登记码解码失败。"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        parse_config_line "$line"
+    done <<<"$payload"
+    [ -n "$CFG_JOIN" ] && [ -n "$CFG_ADMIN_TOKEN" ] && [ -n "$CFG_ADMIN_KEY" ] ||
+        die "登记码内容不完整。"
+    printf '%s' "$CFG_ADMIN_KEY" | grep -Eq '^[A-Za-z0-9+/]{43}=$' || die "登记码里的隧道私钥无效。"
+    printf '%s' "$CFG_SERVER_PUB" | grep -Eq '^[A-Za-z0-9+/]{43}=$' || die "登记码里的服务器公钥无效。"
+    case $CFG_JOIN in
+        http://*) ;;
+        *) die "登记码里的接入地址无效。" ;;
+    esac
+    write_admin_conf
     save_config
 }
 
@@ -186,28 +201,33 @@ APPLESCRIPT
     printf '%s' "$answer"
 }
 
+normalize_registration() {
+    case $1 in
+        WM2:*) printf '%s' "$1" ;;
+        version=2*) printf 'WM2:%s' "$(printf '%s
+' "$1" | base64 | tr -d '
+')" ;;
+        *) printf '' ;;
+    esac
+}
+
 obtain_registration() {
     local output
+    REGISTER=""
     if [ -n "$WGMAINT_REGISTER" ]; then
-        REGISTER=$WGMAINT_REGISTER
-        return 0
-    fi
-    if [ "$FORCE_REGISTER" -eq 0 ]; then
+        REGISTER=$(normalize_registration "$WGMAINT_REGISTER")
+    elif [ "$FORCE_REGISTER" -eq 0 ]; then
         output=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$VPS_TARGET" </dev/null 2>/dev/null || true)
-        output=$(printf '%s\n' "$output" | grep -m1 '^WM2:' || true)
-        if [ -n "$output" ]; then
-            REGISTER=$output
-            return 0
-        fi
-        output=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$VPS_TARGET" 'sudo -n /usr/local/bin/wgmaint invite' </dev/null 2>/dev/null || true)
-        output=$(printf '%s\n' "$output" | grep -m1 '^WM2:' || true)
-        if [ -n "$output" ]; then
-            REGISTER=$output
-            return 0
+        REGISTER=$(normalize_registration "$output")
+        if [ -z "$REGISTER" ]; then
+            output=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$VPS_TARGET" 'sudo -n /usr/local/bin/wgmaint invite' </dev/null 2>/dev/null || true)
+            REGISTER=$(normalize_registration "$output")
         fi
     fi
-    REGISTER=$(ask_register)
-    [ -n "$REGISTER" ] || die "没有登记码，无法继续。"
+    if [ -z "$REGISTER" ]; then
+        REGISTER=$(normalize_registration "$(ask_register)")
+    fi
+    [ -n "$REGISTER" ] || die "没有拿到登记码，请在 VPS 上重新部署后粘贴 WM2 登记码。"
     case $REGISTER in
         WM2:*) ;;
         *) die "登记码格式不对，应以 WM2: 开头。" ;;
@@ -215,18 +235,36 @@ obtain_registration() {
 }
 
 ensure_tunnel() {
-    local wg_quick runner
+    local wg_quick runner log tail_text
     [ "$SKIP_WG" -eq 1 ] && return 0
     wg_quick=$(command -v wg-quick || true)
     [ -n "$wg_quick" ] || die "没有找到 wg-quick，请先安装 wireguard-tools。"
     runner="$dir/up.sh"
+    log="$dir/wg.log"
     cat >"$runner" <<EOF
 #!/bin/bash
-'$wg_quick' show '$iface' >/dev/null 2>&1 || '$wg_quick' up '$admin_conf'
+export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+if wg show '$iface' >/dev/null 2>&1; then chmod 0644 '$log' 2>/dev/null; exit 0; fi
+'$wg_quick' up '$admin_conf' >>'$log' 2>&1 && { chmod 0644 '$log' 2>/dev/null; exit 0; }
+'$wg_quick' down '$admin_conf' >>'$log' 2>&1 || true
+'$wg_quick' up '$admin_conf' >>'$log' 2>&1
+chmod 0644 '$log' 2>/dev/null || true
 EOF
     chmod 700 "$runner"
-    osascript -e "do shell script \"/bin/bash '$runner'\" with administrator privileges" >/dev/null ||
-        die "启动维护隧道失败，请检查 wg-quick 输出。"
+    if sudo -n true >/dev/null 2>&1; then
+        if sudo -n /bin/bash "$runner"; then
+            return 0
+        fi
+        tail_text=$(sudo -n cat "$log" 2>/dev/null | tail -6 | tr '
+' ' ' || true)
+    elif osascript -e "do shell script "/bin/bash '$runner'" with administrator privileges" >/dev/null 2>&1; then
+        return 0
+    else
+        tail_text=$(tail -6 "$log" 2>/dev/null | tr '
+' ' ' || true)
+    fi
+    [ -n "$tail_text" ] || tail_text="请查看 $log"
+    die "启动维护隧道失败：$tail_text"
 }
 
 ensure_package() {
@@ -256,7 +294,16 @@ issue_code() {
     [ -n "$CODE" ] || die "维护 VPS 返回的邀请格式不正确。"
 }
 
-load_config || true
+if ! load_config; then
+    CFG_JOIN=""
+    CFG_ENDPOINT=""
+    CFG_NETWORK=""
+    CFG_SERVER_PUB=""
+    CFG_ADMIN_IP=""
+    CFG_ADMIN_KEY=""
+    CFG_ADMIN_TOKEN=""
+    rm -f "$config" "$admin_conf" 2>/dev/null || true
+fi
 if [ -z "$CFG_JOIN" ]; then
     obtain_registration
     apply_registration "$REGISTER"
