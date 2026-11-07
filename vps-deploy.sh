@@ -347,6 +347,12 @@ def init_db():
                 public_key TEXT PRIMARY KEY,
                 address TEXT NOT NULL UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
         """)
 
 
@@ -437,6 +443,34 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(match.group(1), (STATE / "admin.token").read_text().strip())
 
+    def report(self):
+        form = self.form()
+        if form is None:
+            return self.send_body(400, b"bad request\n")
+        code = form.get("code", "")
+        message = form.get("message", "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{22}", code) or not message:
+            return self.send_body(400, b"bad request\n")
+        message = message[:4000]
+        with closing(db_connect()) as db:
+            if not db.execute("SELECT 1 FROM codes WHERE code = ?", (code,)).fetchone():
+                return self.send_body(403, b"forbidden\n")
+        with closing(db_connect()) as db, db:
+            db.execute("INSERT INTO reports (code, message, created) VALUES (?, ?, ?)",
+                       (code, message, int(time.time())))
+        return self.send_body(200, b"ok\n")
+
+    def reports(self):
+        if not self.authorized():
+            return self.send_body(403, b"forbidden\n")
+        lines = []
+        with closing(db_connect()) as db:
+            for created, code, message in db.execute(
+                    "SELECT created, code, message FROM reports ORDER BY id DESC LIMIT 20"):
+                encoded = base64.b64encode(message.encode("utf-8")).decode("ascii")
+                lines.append("%d %s %s\n" % (created, code, encoded))
+        return self.send_body(200, "".join(lines).encode("ascii"))
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -445,6 +479,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/healthz":
                 return self.send_body(200, b"ok\n")
+            if path == "/v1/status":
+                if not self.authorized():
+                    return self.send_body(403, b"forbidden\n")
+                return self.send_body(200, b"ok\n")
+            if path == "/v1/reports":
+                return self.reports()
             if path == "/v1/package/" + PKG_NAME:
                 if not self.authorized():
                     return self.send_body(403, b"forbidden\n")
@@ -471,6 +511,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.invite()
             if path == "/v1/enroll":
                 return self.enroll()
+            if path == "/v1/report":
+                return self.report()
             if path == "/v1/package/" + PKG_NAME:
                 return self.upload()
             return self.send_body(404, b"not found\n")
@@ -599,7 +641,7 @@ if __name__ == "__main__":
 REGISTRY
 
 put /usr/local/lib/wgmaint/join-windows.ps1 0644 root <<'WINDOWS_PS'
-# Wgmaint Windows customer onboarding. ASCII only; Chinese text is Base64 UTF-8.
+# Wgmaint Windows onboarding. ASCII only; Chinese text is Base64 UTF-8.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $join = '__JOIN__'
@@ -607,7 +649,7 @@ $code = '__CODE__'
 $sshKey = '__SSHKEY__'
 $msiSha = '__MSISHA__'
 $msiSize = __MSISIZE__
-[System.Net.WebRequest]::DefaultWebProxy = $null
+$stage = 'start'
 
 function T([string] $value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
 $M_ELEVATE = '5q2j5Zyo6K+35rGC566h55CG5ZGY5p2D6ZmQ77yM6K+35Zyo5by556qX5Lit54K544CM5piv44CN44CC'
@@ -623,17 +665,41 @@ $M_FAIL = '5o6l5YWl5aSx6LSl44CC'
 $M_ACCOUNT = '57u05oqk6LSm5Y+35bey5a2Y5Zyo5L2G5LiN5Y+X5pys5bel5YW3566h55CG77yM5bey5YGc5q2i44CC'
 $M_MSI_BAD = 'V2lyZUd1YXJkIOWuieijheWMheagoemqjOWksei0pe+8jOivt+mHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
 $M_WG_FAIL = 'V2lyZUd1YXJkIOWuieijheWksei0peOAgg=='
+$M_STAGE = '5b2T5YmN5q2l6aqk77ya'
+$M_PAUSE = '6K+35oyJ5Zue6L2m6ZSu5YWz6Zet56qX5Y+j44CC'
+
+function Report([string] $message) {
+    try {
+        $body = 'code=' + [Uri]::EscapeDataString($code) + '&message=' + [Uri]::EscapeDataString($message)
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Method Post -Uri ($join + '/v1/report') -ContentType 'application/x-www-form-urlencoded' -Body $body | Out-Null
+    } catch {
+    }
+}
+
+function Stop-WithPause([string] $message) {
+    Write-Host ((T $M_FAIL) + $message) -ForegroundColor Red
+    try { Set-Clipboard -Value $message | Out-Null } catch {
+    }
+    try { Read-Host (T $M_PAUSE) } catch {
+    }
+}
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host (T $M_ELEVATE) -ForegroundColor Yellow
-    $arguments = '-NoExit -Command "iex(irm ''' + $join + '/j/' + $code + ''')"'
-    Start-Process powershell -Verb RunAs -ArgumentList $arguments
+    try {
+        $arguments = '-NoExit -Command "iex(irm ''' + $join + '/j/' + $code + ''')"'
+        Start-Process powershell -Verb RunAs -ArgumentList $arguments
+    } catch {
+        Stop-WithPause $_.Exception.Message
+    }
     exit
 }
 
 try {
+    Report ('start build=' + [Environment]::OSVersion.Version.Build + ' ps=' + $PSVersionTable.PSVersion)
+    $stage = 'check'
     if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -or
         [Environment]::OSVersion.Version.Build -lt 17763) {
         throw (T $M_OS)
@@ -643,6 +709,7 @@ try {
     if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root | Out-Null }
     & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
 
+    $stage = 'wireguard'
     Write-Host (T $M_WG)
     $wg = Join-Path $env:ProgramFiles 'WireGuard\wg.exe'
     $wireguard = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
@@ -653,7 +720,7 @@ try {
             if ((Get-Item -LiteralPath $msi).Length -ne $msiSize) { throw (T $M_MSI_BAD) }
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath $msi).Hash -ne $msiSha) { throw (T $M_MSI_BAD) }
             $installer = Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart', 'DO_NOT_LAUNCH=1') -Wait -PassThru
-            if ($installer.ExitCode -eq 3010) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; exit 0 }
+            if ($installer.ExitCode -eq 3010) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; Read-Host (T $M_PAUSE); exit 0 }
             if ($installer.ExitCode -ne 0) { throw ((T $M_WG_FAIL) + ' (' + $installer.ExitCode + ')') }
         } finally {
             Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
@@ -661,6 +728,7 @@ try {
     }
     if (-not (Test-Path -LiteralPath $wg) -or -not (Test-Path -LiteralPath $wireguard)) { throw (T $M_WG_FAIL) }
 
+    $stage = 'key'
     $keyFile = Join-Path $root 'wireguard.key'
     if (-not (Test-Path -LiteralPath $keyFile)) {
         $private = (& $wg genkey).Trim()
@@ -671,6 +739,7 @@ try {
     $public = ($private | & $wg pubkey).Trim()
     if ($LASTEXITCODE -ne 0 -or $public -notmatch '^[A-Za-z0-9+/]{43}=$') { throw (T $M_WG_FAIL) }
 
+    $stage = 'enroll'
     Write-Host (T $M_ENROLL)
     $body = 'code=' + [Uri]::EscapeDataString($code) + '&public_key=' + [Uri]::EscapeDataString($public)
     $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri ($join + '/v1/enroll') -ContentType 'application/x-www-form-urlencoded' -Body $body
@@ -681,6 +750,7 @@ try {
     if (-not $values['address'] -or -not $values['server_public_key'] -or
         -not $values['admin_ip'] -or -not $values['endpoint']) { throw (T $M_FAIL) }
 
+    $stage = 'tunnel'
     $tunnel = 'wgmaint-customer'
     $serviceName = 'WireGuardTunnel$' + $tunnel
     $config = Join-Path $root ($tunnel + '.conf')
@@ -710,6 +780,7 @@ PersistentKeepalive = 25
     }
     if (-not $tunnelOk) { throw (T $M_HANDSHAKE) }
 
+    $stage = 'sshd'
     Write-Host (T $M_SSH)
     $sshd = Join-Path $env:windir 'System32\OpenSSH\sshd.exe'
     if (-not (Test-Path -LiteralPath $sshd)) {
@@ -717,7 +788,7 @@ PersistentKeepalive = 25
         $hadRule = Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue
         try {
             $capability = Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
-            if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; exit 0 }
+            if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; Read-Host (T $M_PAUSE); exit 0 }
         } finally {
             if (-not $hadRule) { Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue | Disable-NetFirewallRule }
         }
@@ -726,10 +797,11 @@ PersistentKeepalive = 25
     $keygen = Join-Path $env:windir 'System32\OpenSSH\ssh-keygen.exe'
     if (-not (Test-Path -LiteralPath $keygen)) {
         $capability = Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0'
-        if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; exit 0 }
+        if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; Read-Host (T $M_PAUSE); exit 0 }
     }
     if (-not (Test-Path -LiteralPath $keygen)) { throw (T $M_SSH_FAIL) }
 
+    $stage = 'account'
     $account = 'wgmaint-ssh'
     $user = Get-LocalUser -Name $account -ErrorAction SilentlyContinue
     $sidFile = Join-Path $root 'account.sid'
@@ -746,6 +818,7 @@ PersistentKeepalive = 25
         Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user
     }
 
+    $stage = 'authorized_keys'
     $hostKey = Join-Path $root 'ssh_host_ed25519_key'
     if (-not (Test-Path -LiteralPath $hostKey)) {
         $created = Start-Process -FilePath $keygen -ArgumentList @('-q', '-t', 'ed25519', '-N', '""', '-f', $hostKey) -Wait -PassThru -NoNewWindow
@@ -755,6 +828,7 @@ PersistentKeepalive = 25
     [IO.File]::WriteAllText($authorized, ('from="' + $values['admin_ip'] + '",restrict,pty ' + $sshKey + [char]10))
     & icacls.exe $authorized /inheritance:r /grant:r ('*' + $user.SID.Value + ':R') /grant:r '*S-1-5-18:F' /grant:r '*S-1-5-32-544:F' | Out-Null
 
+    $stage = 'sshd_config'
     $port = 2222
     $sshdConfig = Join-Path $root 'sshd_config'
     $hostPath = $hostKey.Replace('\', '/')
@@ -778,6 +852,7 @@ UseDNS no
     & $sshd -t -f $sshdConfig
     if ($LASTEXITCODE -ne 0) { throw (T $M_SSH_FAIL) }
 
+    $stage = 'task'
     $taskName = 'Wgmaint OpenSSH'
     $oldTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($oldTask) {
@@ -803,10 +878,15 @@ UseDNS no
 
     Write-Host (T $M_OK) -ForegroundColor Green
     Write-Host ('ssh -p ' + $port + ' ' + $account + '@' + $address)
+    Report ('ok ' + $address)
 } catch {
-    Write-Host ((T $M_FAIL) + $_.Exception.Message) -ForegroundColor Red
-    exit 1
+    $detail = $_.Exception.Message
+    Write-Host ((T $M_FAIL) + $detail) -ForegroundColor Red
+    Write-Host ((T $M_STAGE) + $stage) -ForegroundColor Red
+    Report ($stage + ': ' + $detail)
+    Stop-WithPause $detail
 }
+
 WINDOWS_PS
 
 put /usr/local/bin/wgmaint 0755 root <<'CLI'

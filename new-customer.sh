@@ -15,6 +15,7 @@ KEY="$DEFAULT_KEY"
 MSI="$DEFAULT_MSI"
 FORCE_REGISTER=0
 SKIP_WG=0
+REPORTS=0
 
 usage() {
     cat <<'TEXT'
@@ -69,6 +70,10 @@ while [ $# -gt 0 ]; do
             SKIP_WG=1
             shift
             ;;
+        --reports)
+            REPORTS=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -85,8 +90,10 @@ if [ -z "$VPS_TARGET" ]; then
 fi
 [ -n "$VPS_TARGET" ] || die "请用 --vps 指定维护 VPS，例如 admin@1.2.3.4。"
 
-[ -f "$KEY" ] || die "找不到 SSH 公钥：$KEY"
-[ -f "$MSI" ] || die "找不到 WireGuard 安装包：$MSI"
+if [ "$REPORTS" -eq 0 ]; then
+    [ -f "$KEY" ] || die "找不到 SSH 公钥：$KEY"
+    [ -f "$MSI" ] || die "找不到 WireGuard 安装包：$MSI"
+fi
 
 vps_id=$(printf '%s' "$VPS_TARGET" | shasum -a 256 | cut -c1-8)
 dir="$CONFIG_DIR/$vps_id"
@@ -294,6 +301,27 @@ issue_code() {
     [ -n "$CODE" ] || die "维护 VPS 返回的邀请格式不正确。"
 }
 
+print_reports() {
+    local line created code encoded
+    curl -fsS --max-time 8 -H "Authorization: Bearer $CFG_ADMIN_TOKEN" "$CFG_JOIN/v1/reports" >/tmp/wgmaint-reports.txt 2>/dev/null ||
+        die "读取客户机诊断报告失败。"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        created=$(printf '%s' "$line" | cut -d' ' -f1)
+        code=$(printf '%s' "$line" | cut -d' ' -f2)
+        encoded=$(printf '%s' "$line" | cut -d' ' -f3)
+        printf '%s %s %s\n' "$created" "$code" "$(printf '%s' "$encoded" | base64 -D 2>/dev/null || printf '%s' "$encoded" | base64 -d)"
+    done </tmp/wgmaint-reports.txt
+}
+
+if [ "$REPORTS" -eq 1 ]; then
+    if ! load_config; then
+        die "这台 Mac 还没有登记这台维护 VPS。"
+    fi
+    print_reports
+    exit 0
+fi
+
 if ! load_config; then
     CFG_JOIN=""
     CFG_ENDPOINT=""
@@ -308,16 +336,25 @@ if [ -z "$CFG_JOIN" ]; then
     obtain_registration
     apply_registration "$REGISTER"
 fi
+status_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -H "Authorization: Bearer $CFG_ADMIN_TOKEN" "$CFG_JOIN/v1/status" 2>/dev/null || true)
+if [ "$status_code" != "200" ]; then
+    printf '维护 VPS 已重新登记，正在更新本机配置。\n'
+    rm -f "$config" "$admin_conf" 2>/dev/null || true
+    CFG_JOIN=""
+    obtain_registration
+    apply_registration "$REGISTER"
+    wg_quick_path=$(command -v wg-quick || true)
+    if [ "$SKIP_WG" -eq 0 ] && [ -n "$wg_quick_path" ] && sudo -n true >/dev/null 2>&1; then
+        sudo -n "$wg_quick_path" down "$admin_conf" >/dev/null 2>&1 || true
+    fi
+fi
 ensure_tunnel
 ensure_package
 issue_code
 
-COMMAND="powershell -NoExit -c \"iex(irm $CFG_JOIN/j/$CODE)\""
-length=$(printf '%s' "$COMMAND" | wc -c | tr -d ' ')
+COMMAND="powershell -NoExit -c \"try{iex(irm '$CFG_JOIN/j/$CODE')}catch{Write-Host '接入失败：无法下载接入脚本，请检查网络后重试。' -ForegroundColor Red;Read-Host '按回车关闭窗口'}\""
+length=$(printf '%s' "$COMMAND" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')
 [ "$length" -le 259 ] || die "Windows 接入命令超过 259 字符。"
-if printf '%s' "$COMMAND" | LC_ALL=C grep -q '[^ -~]'; then
-    die "Windows 接入命令包含非 ASCII 字符。"
-fi
 
 if [ "$COPY" -eq 1 ]; then
     printf '%s' "$COMMAND" | pbcopy
