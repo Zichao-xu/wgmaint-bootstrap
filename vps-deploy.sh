@@ -1,25 +1,24 @@
-bash -c 'if (( EUID == 0 )); then exec bash -s; fi; exec sudo env "SSH_CONNECTION=${SSH_CONNECTION:-}" "WGMAINT_ENDPOINT=${WGMAINT_ENDPOINT:-}" "WGMAINT_ADMIN_PUBLIC_KEY=${WGMAINT_ADMIN_PUBLIC_KEY:-}" "WGMAINT_APT_REGION=${WGMAINT_APT_REGION:-}" bash -s' <<'WGMAINT_DEPLOY'
-set -Eeuo pipefail
+bash -c 'if [ "$(id -u)" = 0 ]; then exec bash -s; fi; exec sudo env WGMAINT_APT_REGION="$WGMAINT_APT_REGION" WGMAINT_ENDPOINT="$WGMAINT_ENDPOINT" SSH_CONNECTION="$SSH_CONNECTION" bash -s' <<'WGMAINT_DEPLOY'
+set -Eeo pipefail
 umask 077
-trap 'printf "部署失败。出错行 %s，退出码 %s。\n" "$LINENO" "$?" >&2' ERR
-
+trap 'printf "部署失败：第 %s 行，退出码 %s。\n" "$LINENO" "$?" >&2' ERR
 die() { printf '%s\n' "$*" >&2; exit 1; }
-[[ $(uname -s) == Linux && -d /run/systemd/system ]] || die '请在使用 systemd 的 Linux 服务器上执行。'
+
+[[ $(uname -s) == Linux && -d /run/systemd/system ]] || die '请在使用 systemd 的 Debian 或 Ubuntu 上执行。'
 . /etc/os-release
-[[ $ID == debian || $ID == ubuntu ]] || die '此脚本支持 Debian 和 Ubuntu。'
+[[ $ID == debian || $ID == ubuntu ]] || die '仅支持 Debian 和 Ubuntu。'
 exec 9>/run/lock/wgmaint-deploy.lock
 flock -n 9 || die '已有一个部署任务在运行。'
 
 state=/var/lib/wgmaint
 iface=wgmaint0
-conf=/etc/wireguard/$iface.conf
-settings=$state/settings.json
 wg_port=51820
 join_port=8443
+settings=$state/settings.json
 
 put() {
     local target=$1 mode=$2 group=$3 tmp
-    tmp=$(mktemp "${target}.XXXXXX")
+    tmp=$(mktemp "$target.XXXXXX")
     cat >"$tmp"
     chown "root:$group" "$tmp"
     chmod "$mode" "$tmp"
@@ -34,156 +33,112 @@ put() {
 
 check_null_device() {
     [[ -c /dev/null && $(stat -Lc '%t:%T' /dev/null) == 1:3 ]] ||
-        die '/dev/null 的设备类型或编号有误，应为字符设备 1:3。请先修复 VPS 的设备节点。'
+        die '/dev/null 的设备类型或编号有误，应为字符设备 1:3。'
     if [[ $(stat -Lc '%a' /dev/null) != 666 ]]; then
         printf '正在将 /dev/null 的权限恢复为 0666。\n' >&2
         chmod 0666 /dev/null
     fi
     if getent passwd _apt >/dev/null; then
         runuser -u _apt -- sh -c ': </dev/null && : >/dev/null' ||
-            die 'APT 沙箱用户无法读写 /dev/null。请检查 VPS 的设备权限或访问限制。'
+            die 'APT 沙箱用户无法读写 /dev/null。'
     fi
 }
 
-source_files=()
-for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    if [[ -r $source_file ]]; then
-        source_files+=("$source_file")
-    fi
-done
-has_mirror() {
-    (( ${#source_files[@]} )) &&
-        grep -Eiq "^[[:space:]]*(deb[[:space:]]|URIs:).*https?://($1)/" "${source_files[@]}"
-}
-
-aliyun_ecs=false
-if grep -iq 'Alibaba Cloud' /sys/class/dmi/id/sys_vendor 2>/dev/null ||
-    has_mirror 'mirrors\.(cloud\.)?aliyuncs\.com'; then
-    aliyun_ecs=true
-fi
-
-apt_region=${WGMAINT_APT_REGION:-auto}
-case "$apt_region" in
-    auto)
-        if has_mirror 'mirrors\.aliyun\.com|mirrors\.(cloud\.)?aliyuncs\.com|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.ustc\.edu\.cn|mirrors\.huaweicloud\.com|mirrors\.cloud\.tencent\.com|mirrors\.tencent\.com'; then
-            apt_region=cn
-        else
-            apt_region=system
+install_packages() {
+    local package missing count=0
+    for package in "$@"; do
+        if ! dpkg -s "$package" 2>/dev/null | grep -q '^Status: install ok installed'; then
+            missing="$missing $package"
+            count=$((count + 1))
         fi
-        ;;
-    cn|system) ;;
-    *) die 'WGMAINT_APT_REGION 只接受 auto、cn 或 system。' ;;
-esac
-
-write_mirror_sources() {
-    local mirror=$1 codename=$2 keyring=$3 archive
-    if [[ $ID == debian ]]; then
-        if [[ $codename == bullseye ]]; then
-            # Only the frozen Bullseye security archive needs an exception to metadata expiry.
-            printf 'deb [signed-by=%s] %s/debian-archive/debian/ %s main\n' "$keyring" "$mirror" "$codename"
-            printf 'deb [signed-by=%s check-valid-until=no] %s/debian-archive/debian-security/ %s-security main\n' "$keyring" "$mirror" "$codename"
-        else
-            printf 'deb [signed-by=%s] %s/debian/ %s main\n' "$keyring" "$mirror" "$codename"
-            printf 'deb [signed-by=%s] %s/debian-security/ %s-security main\n' "$keyring" "$mirror" "$codename"
-        fi
-    else
-        case "$(dpkg --print-architecture)" in
-            amd64|i386) archive=ubuntu ;;
-            *) archive=ubuntu-ports ;;
-        esac
-        for suite in "$codename" "$codename-updates" "$codename-security"; do
-            printf 'deb [signed-by=%s] %s/%s/ %s main universe\n' "$keyring" "$mirror" "$archive" "$suite"
-        done
+    done
+    (( count )) || return 0
+    printf '正在安装依赖：%s\n' "$missing"
+    export DEBIAN_FRONTEND=noninteractive
+    if apt-get update -qq </dev/null && apt-get install -y --no-install-recommends $missing </dev/null; then
+        return 0
     fi
-}
-
-install_from_cn_mirrors() (
-    local codename=${VERSION_CODENAME:-} keyring mirror attempt apt_tmp
-    local -a apt_options mirrors
+    apt_region=$WGMAINT_APT_REGION
+    [ -n "$apt_region" ] || apt_region=auto
+    [[ $apt_region == system ]] && die 'APT 安装失败。请检查 VPS 的软件源。'
+    printf '默认软件源失败，改用国内镜像重试。\n'
+    local codename=$VERSION_CODENAME keyring mirror dir archive suite
     [[ $codename =~ ^[a-z][a-z0-9]*$ ]] || die '无法从 /etc/os-release 读取发行版代号。'
     keyring=/usr/share/keyrings/$ID-archive-keyring.gpg
-    [[ -s $keyring ]] || die "缺少发行版软件源签名密钥环 $keyring。"
-    mirrors=(https://mirrors.aliyun.com https://mirrors.tuna.tsinghua.edu.cn)
-    if [[ $ID == debian && $codename == bullseye ]]; then
-        mirrors=(https://mirrors.aliyun.com https://repo.huaweicloud.com/repository)
-    fi
-    if $aliyun_ecs && has_mirror 'mirrors\.cloud\.aliyuncs\.com'; then
-        mirrors=(http://mirrors.cloud.aliyuncs.com "${mirrors[@]}")
-    fi
-
-    apt_tmp=$(mktemp -d /tmp/wgmaint-apt.XXXXXX)
-    trap 'rm -rf -- "$apt_tmp"' EXIT
-    chmod 0755 "$apt_tmp"
-    attempt=0
-    for mirror in "${mirrors[@]}"; do
-        attempt=$((attempt + 1))
-        local mirror_dir=$apt_tmp/$attempt
-        install -d -m 0755 "$mirror_dir" "$mirror_dir/lists" "$mirror_dir/archives"
-        write_mirror_sources "$mirror" "$codename" "$keyring" >"$mirror_dir/sources.list"
-        chmod 0644 "$mirror_dir/sources.list"
-        apt_options=(
-            -o "Dir::Etc::sourcelist=$mirror_dir/sources.list"
-            -o Dir::Etc::sourceparts=-
-            -o "Dir::State::lists=$mirror_dir/lists"
-            -o "Dir::Cache::archives=$mirror_dir/archives"
-            -o APT::Update::Error-Mode=any
-            -o Acquire::Languages=none
-            -o Acquire::Retries=1
-            -o Acquire::ForceIPv4=true
-            -o Acquire::http::Timeout=8
-            -o Acquire::https::Timeout=8
-            -o Acquire::http::Pipeline-Depth=0
-            -o Acquire::AllowInsecureRepositories=false
-            -o APT::Get::AllowUnauthenticated=false
-        )
-        printf '正在使用 APT 镜像 %s（%s）。\n' "$mirror" "$codename"
-        if apt-get "${apt_options[@]}" update </dev/null &&
-            apt-get "${apt_options[@]}" --download-only -y --no-remove --no-install-recommends install "$@" </dev/null; then
-            DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" --no-download -y --no-remove --no-install-recommends install "$@" </dev/null
-            return
+    [[ -s $keyring ]] || die "缺少软件源签名密钥环 $keyring。"
+    for mirror in https://mirrors.aliyun.com https://mirrors.tuna.tsinghua.edu.cn; do
+        dir=$(mktemp -d)
+        mkdir -p "$dir/lists" "$dir/archives"
+        if [[ $ID == debian ]]; then
+            if [[ $codename == bullseye ]]; then
+                printf 'deb [signed-by=%s] %s/debian-archive/debian/ %s main\n' "$keyring" "$mirror" "$codename" >"$dir/sources.list"
+                printf 'deb [signed-by=%s check-valid-until=no] %s/debian-archive/debian-security/ %s-security main\n' "$keyring" "$mirror" "$codename" >>"$dir/sources.list"
+            else
+                printf 'deb [signed-by=%s] %s/debian/ %s main\n' "$keyring" "$mirror" "$codename" >"$dir/sources.list"
+                printf 'deb [signed-by=%s] %s/debian-security/ %s-security main\n' "$keyring" "$mirror" "$codename" >>"$dir/sources.list"
+            fi
+        else
+            case "$(dpkg --print-architecture)" in
+                amd64|i386) archive=ubuntu ;;
+                *) archive=ubuntu-ports ;;
+            esac
+            : >"$dir/sources.list"
+            for suite in "$codename" "$codename-updates" "$codename-security"; do
+                printf 'deb [signed-by=%s] %s/%s/ %s main universe\n' "$keyring" "$mirror" "$archive" "$suite" >>"$dir/sources.list"
+            done
         fi
-        printf 'APT 镜像访问或取包失败：%s\n' "$mirror" >&2
+        if apt-get -o "Dir::Etc::sourcelist=$dir/sources.list" -o Dir::Etc::sourceparts=- \
+            -o "Dir::State::lists=$dir/lists" -o "Dir::Cache::archives=$dir/archives" \
+            -o APT::Update::Error-Mode=any -o Acquire::Languages=none -o Acquire::Retries=1 \
+            -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
+            -o Acquire::http::Pipeline-Depth=0 -o APT::Get::AllowUnauthenticated=false \
+            update -qq </dev/null &&
+            apt-get -o "Dir::Etc::sourcelist=$dir/sources.list" -o Dir::Etc::sourceparts=- \
+            -o "Dir::State::lists=$dir/lists" -o "Dir::Cache::archives=$dir/archives" \
+            -o APT::Get::AllowUnauthenticated=false \
+            install -y --no-install-recommends $missing </dev/null; then
+            rm -rf -- "$dir"
+            return 0
+        fi
+        rm -rf -- "$dir"
+        printf '镜像访问失败：%s\n' "$mirror" >&2
     done
-    die '国内 APT 镜像均未能完成取包，请查看上方的 APT 报错。'
-)
+    die '国内 APT 镜像均未能完成安装。'
+}
 
 check_null_device
-packages=(wireguard-tools nftables iproute2 openssl curl python3 gunicorn)
-missing=()
-for package in "${packages[@]}"; do
-    if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null) != 'install ok installed' ]]; then
-        missing+=("$package")
-    fi
-done
-if (( ${#missing[@]} )); then
-    if [[ $apt_region == cn ]]; then
-        install_from_cn_mirrors "${missing[@]}"
-    else
-        apt-get update </dev/null
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" </dev/null
-    fi
-fi
+install_packages wireguard-tools nftables iproute2 python3 curl
+
+printf '正在清理旧部署（如有）。\n'
+systemctl disable --now wgmaint-registry.service 2>/dev/null || true
+systemctl disable --now wgmaint-firewall.service 2>/dev/null || true
+rm -f /etc/systemd/system/wgmaint-registry.service /etc/systemd/system/wgmaint-firewall.service
+rm -rf /etc/systemd/system/wgmaint-registry.service.d
+systemctl stop "wg-quick@$iface.service" 2>/dev/null || true
+wg-quick down "$iface" 2>/dev/null || true
+rm -f "$state/join.crt" "$state/join.key" "$state/admin.key" "$state/latest-invite.json"
+rm -rf "$state/db"
+rm -f /usr/local/lib/wgmaint/registry.py /usr/local/lib/wgmaint/registry_windows.py \
+    /usr/local/lib/wgmaint/registry_download.py /usr/local/lib/wgmaint/customer-join-windows.ps1 \
+    /usr/local/lib/wgmaint/windows-bootstrap.ps1
+systemctl daemon-reload 2>/dev/null || true
 
 if ! getent passwd wgmaint >/dev/null; then
     useradd --system --user-group --no-create-home --home-dir "$state" --shell /usr/sbin/nologin wgmaint
 fi
 install -d -m 0750 -o root -g wgmaint "$state"
-install -d -m 0700 -o wgmaint -g wgmaint "$state/db"
+install -d -m 0750 -o wgmaint -g wgmaint "$state/db" "$state/pkg"
 install -d -m 0700 /etc/wireguard
 install -d -m 0755 /usr/local/lib/wgmaint "/etc/systemd/system/wg-quick@$iface.service.d"
 
+aliyun_ecs=false
+if grep -iq 'Alibaba Cloud' /sys/class/dmi/id/sys_vendor 2>/dev/null; then
+    aliyun_ecs=true
+fi
+
 if [[ ! -f $settings ]]; then
-    [[ ! -e $conf ]] || die "配置文件 $conf 已存在。为避免覆盖，部署已停止。"
-    if ip link show dev "$iface" >/dev/null 2>&1; then
-        die "网络接口 $iface 已存在。"
-    fi
-    if nft list table inet wgmaint >/dev/null 2>&1; then
-        die 'nftables 中已存在名为 wgmaint 的规则表。'
-    fi
-    if [[ -n $(ss -H -lun "sport = :$wg_port") || -n $(ss -H -ltn "sport = :$join_port") ]]; then
-        die "端口冲突。部署需要 UDP $wg_port 和 TCP $join_port。"
-    fi
-    discovered=$(/usr/bin/python3 - "${WGMAINT_ENDPOINT:-}" "${SSH_CONNECTION:-}" "$aliyun_ecs" <<'DISCOVER'
+    [[ ! -e /etc/wireguard/$iface.conf ]] || die "配置文件 /etc/wireguard/$iface.conf 已存在但缺少设置记录，已停止。"
+    discovered=$(/usr/bin/python3 - "$WGMAINT_ENDPOINT" "$SSH_CONNECTION" "$aliyun_ecs" <<'DISCOVER'
 import ipaddress
 import json
 import re
@@ -217,16 +172,17 @@ def aliyun_public_ip():
     return ""
 
 
-endpoint, ssh, aliyun_ecs = sys.argv[1:]
+command_line, ssh, aliyun_ecs = sys.argv[1], sys.argv[2], sys.argv[3]
+endpoint = command_line.strip()
 if not endpoint:
     addresses = {
         ipaddress.IPv4Address(info["local"])
         for device in json.loads(subprocess.check_output(["ip", "-j", "-4", "addr", "show", "scope", "global"]))
         for info in device.get("addr_info", [])
     }
-    public = {ip for ip in addresses if ip.is_global and not ip.is_multicast}
+    public = set(ip for ip in addresses if ip.is_global and not ip.is_multicast)
     fields = ssh.split()
-    if len(fields) == 4 and fields[2] in {str(ip) for ip in public}:
+    if len(fields) == 4 and fields[2] in set(str(ip) for ip in public):
         endpoint = fields[2]
     elif len(public) == 1:
         endpoint = str(next(iter(public)))
@@ -254,7 +210,7 @@ routes = [
 for prefix in ("10.203.249", "10.239.246", "172.30.231", "192.168.237"):
     net = ipaddress.IPv4Network(prefix + ".0/24")
     if all(not net.overlaps(route) for route in routes):
-        print(json.dumps({"endpoint": endpoint, "san": san, "network": str(net)}))
+        print(json.dumps({"endpoint": endpoint, "network": str(net)}))
         break
 else:
     sys.exit("候选隧道网段均与 VPS 的现有路由冲突。")
@@ -263,20 +219,18 @@ DISCOVER
     put "$settings" 0640 wgmaint <<<"$discovered"
 fi
 
-mapfile -t values < <(/usr/bin/python3 - "$settings" <<'SETTINGS'
+read -r endpoint network vps_ip admin_ip < <(/usr/bin/python3 - "$settings" <<'SETTINGS'
 import ipaddress
 import json
 import sys
 
 s = json.load(open(sys.argv[1]))
 n = ipaddress.IPv4Network(s["network"])
-for value in (s["endpoint"], s["san"], str(n), n[1], n[2]):
-    print(value)
+print(s["endpoint"], str(n), n[1], n[2])
 SETTINGS
 )
-[[ ${#values[@]} == 5 ]] || die '无法读取部署配置。'
-endpoint=${values[0]} san=${values[1]} network=${values[2]} vps_ip=${values[3]} admin_ip=${values[4]}
-if [[ -n ${WGMAINT_ENDPOINT:-} && $endpoint != "$WGMAINT_ENDPOINT" ]]; then
+[[ -n $endpoint && -n $network && -n $vps_ip && -n $admin_ip ]] || die '无法读取部署配置。'
+if [[ -n $WGMAINT_ENDPOINT && $endpoint != "$WGMAINT_ENDPOINT" ]]; then
     die "现有部署使用的公网入口是 $endpoint。"
 fi
 
@@ -284,68 +238,14 @@ if [[ ! -s $state/server.key ]]; then
     key=$(wg genkey)
     put "$state/server.key" 0600 root <<<"$key"
 fi
-key=$(wg pubkey <"$state/server.key")
-put "$state/server.pub" 0640 wgmaint <<<"$key"
+wg pubkey <"$state/server.key" | put "$state/server.pub" 0640 wgmaint
 
-if [[ ! -s $state/admin.pub ]]; then
-    if [[ -n ${WGMAINT_ADMIN_PUBLIC_KEY:-} ]]; then
-        key=$(/usr/bin/python3 - "$WGMAINT_ADMIN_PUBLIC_KEY" <<'ADMINKEY'
-import base64
-import sys
-
-key = sys.argv[1]
-try:
-    raw = base64.b64decode(key, validate=True)
-except ValueError:
-    sys.exit("WGMAINT_ADMIN_PUBLIC_KEY 不是有效的 WireGuard 公钥。")
-if len(raw) != 32 or not any(raw) or base64.b64encode(raw).decode() != key:
-    sys.exit("WGMAINT_ADMIN_PUBLIC_KEY 不是有效的 WireGuard 公钥。")
-print(key)
-ADMINKEY
-        )
-        put "$state/admin.pub" 0640 wgmaint <<<"$key"
-    else
-        if [[ ! -s $state/admin.key ]]; then
-            key=$(wg genkey)
-            put "$state/admin.key" 0600 root <<<"$key"
-        fi
-        key=$(wg pubkey <"$state/admin.key")
-        put "$state/admin.pub" 0640 wgmaint <<<"$key"
-    fi
-fi
-if [[ -n ${WGMAINT_ADMIN_PUBLIC_KEY:-} && $(cat "$state/admin.pub") != "$WGMAINT_ADMIN_PUBLIC_KEY" ]]; then
-    die '提供的管理端公钥与现有部署记录不一致。'
-fi
-[[ $(cat "$state/admin.pub") != "$(cat "$state/server.pub")" ]] || die '管理端和服务器必须使用不同的 WireGuard 公钥。'
-
-if [[ ! -s $state/join.crt || ! -s $state/join.key ]]; then
-    cert_tmp=$(mktemp -d "$state/cert.XXXXXX")
-    openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -subj '/CN=wgmaint-enrollment' -addext "subjectAltName=$san" \
-        -addext 'basicConstraints=critical,CA:FALSE' -addext 'extendedKeyUsage=serverAuth' \
-        -keyout "$cert_tmp/key" -out "$cert_tmp/cert" >/dev/null 2>&1
-    put "$state/join.key" 0640 wgmaint <"$cert_tmp/key"
-    put "$state/join.crt" 0640 wgmaint <"$cert_tmp/cert"
-    rm -rf -- "$cert_tmp"
-fi
-
-put "$conf" 0600 root <<WGCONF
+admin_key=$(wg genkey)
+admin_pub=$(printf '%s\n' "$admin_key" | wg pubkey)
+put "$state/admin.pub" 0640 wgmaint <<<"$admin_pub"
+put "$state/admin.conf" 0640 wgmaint <<ADMINCONF
 [Interface]
-Address = $vps_ip/24
-ListenPort = $wg_port
-PrivateKey = $(cat "$state/server.key")
-PostUp = /sbin/sysctl -qw net.ipv4.conf.%i.forwarding=1
-PostUp = /sbin/sysctl -qw net.ipv4.conf.%i.send_redirects=0
-
-[Peer]
-PublicKey = $(cat "$state/admin.pub")
-AllowedIPs = $admin_ip/32
-WGCONF
-
-if [[ -s $state/admin.key ]]; then
-    put "$state/admin.conf" 0600 root <<ADMINCONF
-[Interface]
-PrivateKey = $(cat "$state/admin.key")
+PrivateKey = $admin_key
 Address = $admin_ip/32
 
 [Peer]
@@ -354,8 +254,23 @@ Endpoint = $endpoint:$wg_port
 AllowedIPs = $network
 PersistentKeepalive = 25
 ADMINCONF
-    rm -f -- "$state/admin.key"
-fi
+
+admin_token=$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+put "$state/admin.token" 0640 wgmaint <<<"$admin_token"
+
+put "/etc/wireguard/$iface.conf" 0600 root <<WGCONF
+[Interface]
+Address = $vps_ip/24
+ListenPort = $wg_port
+PrivateKey = $(cat "$state/server.key")
+PostUp = /sbin/sysctl -qw net.ipv4.conf.%i.forwarding=1
+PostUp = /sbin/sysctl -qw net.ipv4.conf.%i.send_redirects=0
+PostUp = /sbin/sysctl -qw net.ipv4.ip_forward=1
+
+[Peer]
+PublicKey = $admin_pub
+AllowedIPs = $admin_ip/32
+WGCONF
 
 put "$state/firewall.nft" 0600 root <<RULES
 add table inet wgmaint
@@ -368,8 +283,8 @@ table inet wgmaint {
     }
     chain forward {
         type filter hook forward priority -10; policy accept;
-        iifname "$iface" oifname "$iface" ip saddr $admin_ip ip daddr $network tcp dport 22 ct state { new, established } accept
-        iifname "$iface" oifname "$iface" ip saddr $network ip daddr $admin_ip tcp sport 22 ct state established accept
+        iifname "$iface" oifname "$iface" ip saddr $admin_ip ip daddr $network tcp dport { 22, 2222 } ct state { new, established } accept
+        iifname "$iface" oifname "$iface" ip saddr $network ip daddr $admin_ip tcp sport { 22, 2222 } ct state established accept
         iifname "$iface" drop
         oifname "$iface" drop
     }
@@ -384,6 +299,7 @@ nft -c -f "$state/firewall.nft"
 put /usr/local/lib/wgmaint/registry.py 0644 root <<'REGISTRY'
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import re
@@ -393,20 +309,19 @@ import subprocess
 import sys
 import time
 from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 STATE = Path("/var/lib/wgmaint")
 IFACE = "wgmaint0"
-JOIN_PORT = 8443
+PORT = 8443
 WG_PORT = 51820
-TTL = 900
-MAX_BODY = 1024
-
-
-class RequestError(Exception):
-    def __init__(self, status, message):
-        self.status = status
-        self.message = message
+TTL = 7200
+MAX_UPLOAD = 80 * 1024 * 1024
+PKG_NAME = "windows.msi"
+PKG_DIR = STATE / "pkg"
+SERVER_VERSION = "wgmaint/2"
 
 
 def settings():
@@ -414,7 +329,7 @@ def settings():
 
 
 def db_connect():
-    connection = sqlite3.connect(STATE / "db" / "registry.sqlite", timeout=5)
+    connection = sqlite3.connect(str(STATE / "db" / "registry.sqlite"), timeout=10)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
@@ -422,156 +337,490 @@ def db_connect():
 def init_db():
     with closing(db_connect()) as db, db:
         db.executescript("""
+            CREATE TABLE IF NOT EXISTS codes (
+                code TEXT PRIMARY KEY,
+                os TEXT NOT NULL,
+                ssh_key TEXT NOT NULL,
+                expires INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS peers (
                 public_key TEXT PRIMARY KEY,
                 address TEXT NOT NULL UNIQUE
             );
-            CREATE TABLE IF NOT EXISTS invitations (
-                digest TEXT PRIMARY KEY,
-                expires INTEGER NOT NULL,
-                public_key TEXT REFERENCES peers (public_key)
-            );
         """)
 
 
-def wg(*args):
-    return subprocess.check_output(["/usr/bin/wg", *args], timeout=5, text=True).strip()
+def origin():
+    return "http://" + settings()["endpoint"] + ":" + str(PORT)
 
 
-def file_value(name):
-    return (STATE / name).read_text().strip()
+def server_public_key():
+    return (STATE / "server.pub").read_text().strip()
 
 
-def config():
-    data = settings()
-    network = ipaddress.IPv4Network(data["network"])
-    return {
-        "endpoint": f"{data['endpoint']}:{WG_PORT}",
-        "server_public_key": file_value("server.pub"),
-        "admin_ip": str(network[2]),
-    }
+def admin_ip():
+    return str(ipaddress.IPv4Network(settings()["network"])[2])
 
 
-def apply_peer(key, address):
-    wg("set", IFACE, "peer", key, "allowed-ips", address + "/32")
+def wg_apply(public_key, address):
+    subprocess.run(
+        ["/usr/bin/wg", "set", IFACE, "peer", public_key,
+         "allowed-ips", str(ipaddress.IPv4Address(address)) + "/32"],
+        check=True, timeout=10,
+    )
 
 
 def restore_peers():
     with closing(db_connect()) as db:
-        for key, address in db.execute("SELECT public_key, address FROM peers"):
-            apply_peer(key, address)
+        for public_key, address in db.execute("SELECT public_key, address FROM peers"):
+            wg_apply(public_key, address)
 
 
-def digest(token):
-    return hashlib.sha256(token.encode("ascii")).hexdigest()
+def package_path():
+    return PKG_DIR / PKG_NAME
 
 
-def invite():
-    token = secrets.token_urlsafe(32)
-    now = int(time.time())
-    expires = now + TTL
-    with closing(db_connect()) as db, db:
-        db.execute("DELETE FROM invitations WHERE expires <= ?", (now,))
-        db.execute("INSERT INTO invitations VALUES (?, ?, NULL)", (digest(token), expires))
-    print(json.dumps({
-        **config(),
-        "url": f"https://{settings()['endpoint']}:{JOIN_PORT}/v1/enroll",
-        "certificate": file_value("join.crt") + "\n",
-        "token": token,
-        "expires_at": expires,
-    }, indent=2))
+def package_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def valid_key(key):
-    if not isinstance(key, str) or len(key) != 44:
+def valid_public_key(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9+/]{43}=", value):
         return False
     try:
-        raw = base64.b64decode(key, validate=True)
+        raw = base64.b64decode(value, validate=True)
     except ValueError:
         return False
-    return len(raw) == 32 and any(raw) and base64.b64encode(raw).decode() == key
+    return len(raw) == 32 and any(raw)
 
 
-def enroll(payload):
-    if not isinstance(payload, dict):
-        raise RequestError("400 Bad Request", "invalid payload")
-    token, key = payload.get("token"), payload.get("public_key")
-    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-        raise RequestError("403 Forbidden", "invalid or expired invitation")
-    if not valid_key(key) or key in (file_value("server.pub"), file_value("admin.pub")):
-        raise RequestError("400 Bad Request", "invalid peer public key")
-
-    token_digest = digest(token)
-    with closing(db_connect()) as db, db:
-        db.execute("BEGIN IMMEDIATE")
-        row = db.execute(
-            "SELECT expires, public_key FROM invitations WHERE digest = ?", (token_digest,)
-        ).fetchone()
-        if not row or row[0] <= time.time() or row[1] not in (None, key):
-            raise RequestError("403 Forbidden", "invalid or expired invitation")
-        existing = db.execute("SELECT address FROM peers WHERE public_key = ?", (key,)).fetchone()
-        if existing:
-            address = existing[0]
-        else:
-            network = ipaddress.IPv4Network(settings()["network"])
-            used = {row[0] for row in db.execute("SELECT address FROM peers")}
-            address = next((str(network[i]) for i in range(3, 255) if str(network[i]) not in used), None)
-            if address is None:
-                raise RequestError("409 Conflict", "address pool exhausted")
-            db.execute("INSERT INTO peers VALUES (?, ?)", (key, address))
-        db.execute("UPDATE invitations SET public_key = ? WHERE digest = ?", (key, token_digest))
-
-    # Persist first so a failed kernel update can be retried by the same peer.
-    apply_peer(key, address)
-    return {**config(), "address": address + "/32"}
+def valid_ssh_key(value):
+    return isinstance(value, str) and bool(
+        re.fullmatch(r"(?:ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) [A-Za-z0-9+/=]{16,1200}", value)
+    )
 
 
-def application(environ, start_response):
-    route = environ["REQUEST_METHOD"], environ["PATH_INFO"]
-    status = "200 OK"
-    try:
-        if route == ("GET", "/healthz"):
-            result = {"ready": True}
-        elif route == ("POST", "/v1/enroll"):
-            length = int(environ.get("CONTENT_LENGTH") or 0)
-            if not 0 < length <= MAX_BODY:
-                raise RequestError("400 Bad Request", "invalid body length")
-            result = enroll(json.loads(environ["wsgi.input"].read(length)))
-        else:
-            raise RequestError("404 Not Found", "not found")
-    except RequestError as exc:
-        status, result = exc.status, {"error": exc.message}
-    except (ValueError, UnicodeError):
-        status, result = "400 Bad Request", {"error": "invalid JSON"}
-    except (OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError) as exc:
-        print(f"接入登记服务出错：{type(exc).__name__}", file=sys.stderr)
-        status, result = "503 Service Unavailable", {"error": "retry later"}
+class Handler(BaseHTTPRequestHandler):
+    server_version = SERVER_VERSION
 
-    body = json.dumps(result).encode("utf-8") + b"\n"
-    start_response(status, [("Content-Type", "application/json"),
-                            ("Content-Length", str(len(body))),
-                            ("Cache-Control", "no-store")])
-    return [body]
+    def log_message(self, *args):
+        pass
+
+    def send_body(self, status, body=b"", content_type="text/plain; charset=utf-8"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def form(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if not 0 < length <= 16384:
+            return None
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeError:
+            return None
+        return {key: value[0] for key, value in parse_qs(raw).items()}
+
+    def authorized(self):
+        match = re.fullmatch(r"Bearer ([A-Za-z0-9_-]{43})", self.headers.get("Authorization") or "")
+        if not match:
+            return False
+        return hmac.compare_digest(match.group(1), (STATE / "admin.token").read_text().strip())
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        path = urlsplit(self.path).path
+        try:
+            if path == "/healthz":
+                return self.send_body(200, b"ok\n")
+            if path == "/v1/package/" + PKG_NAME:
+                if not self.authorized():
+                    return self.send_body(403, b"forbidden\n")
+                package = package_path()
+                if not package.is_file():
+                    return self.send_body(404, b"missing\n")
+                status = "size=%d\nsha256=%s\n" % (package.stat().st_size, package_digest(package))
+                return self.send_body(200, status.encode("ascii"))
+            match = re.fullmatch(r"/j/([A-Za-z0-9_-]{22})", path)
+            if match:
+                return self.join_script(match.group(1))
+            match = re.fullmatch(r"/j/([A-Za-z0-9_-]{22})/pkg/" + re.escape(PKG_NAME), path)
+            if match:
+                return self.package(match.group(1))
+            return self.send_body(404, b"not found\n")
+        except OSError as error:
+            print("读取文件失败：%s" % type(error).__name__, file=sys.stderr)
+            return self.send_body(500, b"error\n")
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        try:
+            if path == "/v1/invite":
+                return self.invite()
+            if path == "/v1/enroll":
+                return self.enroll()
+            if path == "/v1/package/" + PKG_NAME:
+                return self.upload()
+            return self.send_body(404, b"not found\n")
+        except (ValueError, UnicodeError):
+            return self.send_body(400, b"bad request\n")
+        except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+            print("服务内部错误：%s" % type(error).__name__, file=sys.stderr)
+            return self.send_body(503, b"retry later\n")
+
+    def join_script(self, code):
+        with closing(db_connect()) as db:
+            row = db.execute("SELECT os, ssh_key, expires FROM codes WHERE code = ?", (code,)).fetchone()
+        if not row or row[2] <= time.time():
+            return self.send_body(404, b"expired\n")
+        if row[0] != "windows":
+            return self.send_body(404, b"unsupported\n")
+        package = package_path()
+        if not package.is_file():
+            return self.send_body(503, b"package missing\n")
+        template = Path(__file__).with_name("join-windows.ps1").read_text()
+        body = (template
+                .replace("__JOIN__", origin())
+                .replace("__CODE__", code)
+                .replace("__SSHKEY__", row[1])
+                .replace("__MSISIZE__", str(package.stat().st_size))
+                .replace("__MSISHA__", package_digest(package)))
+        return self.send_body(200, body.encode("ascii"))
+
+    def package(self, code):
+        with closing(db_connect()) as db:
+            row = db.execute("SELECT expires FROM codes WHERE code = ?", (code,)).fetchone()
+        if not row or row[0] <= time.time():
+            return self.send_body(404, b"expired\n")
+        path = package_path()
+        if not path.is_file():
+            return self.send_body(503, b"package missing\n")
+        return self.send_body(200, path.read_bytes(), "application/octet-stream")
+
+    def invite(self):
+        if not self.authorized():
+            return self.send_body(403, b"forbidden\n")
+        form = self.form()
+        if form is None:
+            return self.send_body(400, b"bad request\n")
+        os_name = form.get("os", "")
+        ssh_key = form.get("ssh", "")
+        if os_name not in ("windows", "mac") or not valid_ssh_key(ssh_key):
+            return self.send_body(400, b"bad request\n")
+        code = secrets.token_urlsafe(16)
+        expires = int(time.time()) + TTL
+        with closing(db_connect()) as db, db:
+            db.execute("INSERT INTO codes VALUES (?, ?, ?, ?)", (code, os_name, ssh_key, expires))
+        body = "code=%s\nexpires_at=%d\n" % (code, expires)
+        return self.send_body(200, body.encode("ascii"))
+
+    def enroll(self):
+        form = self.form()
+        if form is None:
+            return self.send_body(400, b"bad request\n")
+        code = form.get("code", "")
+        public_key = form.get("public_key", "")
+        if not valid_public_key(public_key):
+            return self.send_body(400, b"bad request\n")
+        now = time.time()
+        with closing(db_connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT expires FROM codes WHERE code = ?", (code,)).fetchone()
+            if not row or row[0] <= now:
+                return self.send_body(403, b"expired\n")
+            existing = db.execute("SELECT address FROM peers WHERE public_key = ?", (public_key,)).fetchone()
+            if existing:
+                address = existing[0]
+            else:
+                network = ipaddress.IPv4Network(settings()["network"])
+                used = set(record[0] for record in db.execute("SELECT address FROM peers"))
+                address = None
+                for index in range(3, 255):
+                    candidate = str(network[index])
+                    if candidate not in used:
+                        address = candidate
+                        break
+                if address is None:
+                    return self.send_body(409, b"full\n")
+                db.execute("INSERT INTO peers VALUES (?, ?)", (public_key, address))
+            wg_apply(public_key, address)
+        body = "address=%s/32\nendpoint=%s:%d\nserver_public_key=%s\nadmin_ip=%s\n" % (
+            address, settings()["endpoint"], WG_PORT, server_public_key(), admin_ip())
+        return self.send_body(200, body.encode("ascii"))
+
+    def upload(self):
+        if not self.authorized():
+            return self.send_body(403, b"forbidden\n")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self.send_body(400, b"bad request\n")
+        if not 0 < length <= MAX_UPLOAD:
+            return self.send_body(400, b"bad request\n")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            return self.send_body(400, b"short read\n")
+        package = package_path()
+        temporary = PKG_DIR / (".upload-" + secrets.token_hex(6))
+        temporary.write_bytes(data)
+        temporary.chmod(0o640)
+        package.write_bytes(data)
+        package.chmod(0o640)
+        temporary.unlink(missing_ok=True)
+        status = "size=%d\nsha256=%s\n" % (len(data), hashlib.sha256(data).hexdigest())
+        return self.send_body(200, status.encode("ascii"))
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "invite":
+        sys.stdout.write((STATE / "register.txt").read_text())
+        return
+    init_db()
+    restore_peers()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["restore"]:
-        init_db()
-        restore_peers()
-    elif sys.argv[1:] == ["invite"]:
-        invite()
-    else:
-        sys.exit("用法：registry.py restore|invite")
+    main()
 REGISTRY
 
-put /etc/systemd/system/wgmaint-firewall.service 0644 root <<FIREWALL_UNIT
+put /usr/local/lib/wgmaint/join-windows.ps1 0644 root <<'WINDOWS_PS'
+# Wgmaint Windows customer onboarding. ASCII only; Chinese text is Base64 UTF-8.
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$join = '__JOIN__'
+$code = '__CODE__'
+$sshKey = '__SSHKEY__'
+$msiSha = '__MSISHA__'
+$msiSize = __MSISIZE__
+
+function T([string] $value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
+$M_ELEVATE = '5q2j5Zyo6K+35rGC566h55CG5ZGY5p2D6ZmQ77yM6K+35Zyo5by556qX5Lit54K544CM5piv44CN44CC'
+$M_OS = '6ZyA6KaBIFdpbmRvd3MgMTAgMTgwOSDmiJbmm7TmlrDnmoQgNjQg5L2N57O757uf44CC'
+$M_WG = '5q2j5Zyo5a6J6KOFIFdpcmVHdWFyZC4uLg=='
+$M_ENROLL = '5q2j5Zyo55m76K6w6Zqn6YGTLi4u'
+$M_SSH = '5q2j5Zyo6YWN572uIFNTSC4uLg=='
+$M_OK = '5o6l5YWl5oiQ5Yqf77yB5Zyo57u05oqkIE1hYyDkuIrmiafooYzvvJo='
+$M_REBOOT = '5a6J6KOF6ZyA6KaB6YeN5ZCv44CC6K+36YeN5ZCv55S16ISR5ZCO6YeN5paw57KY6LS05ZCM5LiA5p2h5ZG95Luk44CC'
+$M_HANDSHAKE = 'V2lyZUd1YXJkIOacquWujOaIkOaPoeaJi++8jOivt+ajgOafpeWuouaIt+acuue9kee7nOWQjumHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
+$M_SSH_FAIL = 'T3BlblNTSCDmnI3liqHlmajlronoo4XlpLHotKXjgILor7fliLDorr7nva4t5bqU55SoLeWPr+mAieWKn+iDveaJi+WKqOWuieijhSBPcGVuU1NIIOacjeWKoeWZqO+8jOWGjeeUqOWQjOS4gOadoeWRveS7pOmHjeivleOAgg=='
+$M_FAIL = '5o6l5YWl5aSx6LSl44CC'
+$M_ACCOUNT = '57u05oqk6LSm5Y+35bey5a2Y5Zyo5L2G5LiN5Y+X5pys5bel5YW3566h55CG77yM5bey5YGc5q2i44CC'
+$M_MSI_BAD = 'V2lyZUd1YXJkIOWuieijheWMheagoemqjOWksei0pe+8jOivt+mHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
+$M_WG_FAIL = 'V2lyZUd1YXJkIOWuieijheWksei0peOAgg=='
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host (T $M_ELEVATE) -ForegroundColor Yellow
+    $arguments = '-NoExit -Command "iex(irm ''' + $join + '/j/' + $code + ''')"'
+    Start-Process powershell -Verb RunAs -ArgumentList $arguments
+    exit
+}
+
+try {
+    if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -or
+        [Environment]::OSVersion.Version.Build -lt 17763) {
+        throw (T $M_OS)
+    }
+
+    $root = Join-Path $env:ProgramData 'Wgmaint'
+    if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root | Out-Null }
+    & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+
+    Write-Host (T $M_WG)
+    $wg = Join-Path $env:ProgramFiles 'WireGuard\wg.exe'
+    $wireguard = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
+    if (-not (Test-Path -LiteralPath $wg)) {
+        $msi = Join-Path $root 'wireguard.msi'
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri ($join + '/j/' + $code + '/pkg/windows.msi') -OutFile $msi
+            if ((Get-Item -LiteralPath $msi).Length -ne $msiSize) { throw (T $M_MSI_BAD) }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $msi).Hash -ne $msiSha) { throw (T $M_MSI_BAD) }
+            $installer = Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart', 'DO_NOT_LAUNCH=1') -Wait -PassThru
+            if ($installer.ExitCode -eq 3010) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; exit 0 }
+            if ($installer.ExitCode -ne 0) { throw ((T $M_WG_FAIL) + ' (' + $installer.ExitCode + ')') }
+        } finally {
+            Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not (Test-Path -LiteralPath $wg) -or -not (Test-Path -LiteralPath $wireguard)) { throw (T $M_WG_FAIL) }
+
+    $keyFile = Join-Path $root 'wireguard.key'
+    if (-not (Test-Path -LiteralPath $keyFile)) {
+        $private = (& $wg genkey).Trim()
+        if ($LASTEXITCODE -ne 0 -or $private -notmatch '^[A-Za-z0-9+/]{43}=$') { throw (T $M_WG_FAIL) }
+        [IO.File]::WriteAllText($keyFile, $private + [char]10)
+    }
+    $private = [IO.File]::ReadAllText($keyFile).Trim()
+    $public = ($private | & $wg pubkey).Trim()
+    if ($LASTEXITCODE -ne 0 -or $public -notmatch '^[A-Za-z0-9+/]{43}=$') { throw (T $M_WG_FAIL) }
+
+    Write-Host (T $M_ENROLL)
+    $body = 'code=' + [Uri]::EscapeDataString($code) + '&public_key=' + [Uri]::EscapeDataString($public)
+    $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri ($join + '/v1/enroll') -ContentType 'application/x-www-form-urlencoded' -Body $body
+    $values = @{}
+    foreach ($line in [Regex]::Split($response.Content, '[\r\n]+')) {
+        if ($line -match '^([a-z_]+)=(.*)$') { $values[$matches[1]] = $matches[2] }
+    }
+    if (-not $values['address'] -or -not $values['server_public_key'] -or
+        -not $values['admin_ip'] -or -not $values['endpoint']) { throw (T $M_FAIL) }
+
+    $tunnel = 'wgmaint-customer'
+    $serviceName = 'WireGuardTunnel$' + $tunnel
+    $config = Join-Path $root ($tunnel + '.conf')
+    $text = @"
+[Interface]
+PrivateKey = $private
+Address = $($values['address'])
+
+[Peer]
+PublicKey = $($values['server_public_key'])
+AllowedIPs = $($values['admin_ip'])/32
+Endpoint = $($values['endpoint'])
+PersistentKeepalive = 25
+"@
+    [IO.File]::WriteAllText($config, $text)
+    $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($existing) { & $wireguard /uninstalltunnelservice $tunnel | Out-Null }
+    & $wireguard /installtunnelservice $config | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw (T $M_WG_FAIL) }
+    $address = $values['address'].Split('/')[0]
+    $tunnelOk = $false
+    foreach ($attempt in 1..45) {
+        $handshake = & $wg show $tunnel latest-handshakes 2>$null
+        if ($LASTEXITCODE -eq 0 -and $handshake -match '\s[1-9][0-9]*\s*$' -and
+            (Get-NetIPAddress -IPAddress $address -ErrorAction SilentlyContinue)) { $tunnelOk = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $tunnelOk) { throw (T $M_HANDSHAKE) }
+
+    Write-Host (T $M_SSH)
+    $sshd = Join-Path $env:windir 'System32\OpenSSH\sshd.exe'
+    if (-not (Test-Path -LiteralPath $sshd)) {
+        $defaultRule = 'OpenSSH-Server-In-TCP'
+        $hadRule = Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue
+        try {
+            $capability = Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+            if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; exit 0 }
+        } finally {
+            if (-not $hadRule) { Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue | Disable-NetFirewallRule }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $sshd)) { throw (T $M_SSH_FAIL) }
+    $keygen = Join-Path $env:windir 'System32\OpenSSH\ssh-keygen.exe'
+    if (-not (Test-Path -LiteralPath $keygen)) {
+        $capability = Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0'
+        if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; exit 0 }
+    }
+    if (-not (Test-Path -LiteralPath $keygen)) { throw (T $M_SSH_FAIL) }
+
+    $account = 'wgmaint-ssh'
+    $user = Get-LocalUser -Name $account -ErrorAction SilentlyContinue
+    $sidFile = Join-Path $root 'account.sid'
+    if ($user -and (-not (Test-Path -LiteralPath $sidFile) -or [IO.File]::ReadAllText($sidFile) -ne $user.SID.Value)) {
+        throw (T $M_ACCOUNT)
+    }
+    if (-not $user) {
+        $random = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N') + 'Aa1!'
+        $user = New-LocalUser -Name $account -Password (ConvertTo-SecureString $random -AsPlainText -Force) -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires
+        [IO.File]::WriteAllText($sidFile, $user.SID.Value)
+    }
+    if (@(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object { $_.SID -eq $user.SID }).Count -gt 0) { throw (T $M_ACCOUNT) }
+    if (@(Get-LocalGroupMember -SID 'S-1-5-32-545' | Where-Object { $_.SID -eq $user.SID }).Count -eq 0) {
+        Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user
+    }
+
+    $hostKey = Join-Path $root 'ssh_host_ed25519_key'
+    if (-not (Test-Path -LiteralPath $hostKey)) {
+        $created = Start-Process -FilePath $keygen -ArgumentList @('-q', '-t', 'ed25519', '-N', '""', '-f', $hostKey) -Wait -PassThru -NoNewWindow
+        if ($created.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $hostKey)) { throw (T $M_SSH_FAIL) }
+    }
+    $authorized = Join-Path $root 'authorized_keys'
+    [IO.File]::WriteAllText($authorized, ('from="' + $values['admin_ip'] + '",restrict,pty ' + $sshKey + [char]10))
+    & icacls.exe $authorized /inheritance:r /grant:r ('*' + $user.SID.Value + ':R') /grant:r '*S-1-5-18:F' /grant:r '*S-1-5-32-544:F' | Out-Null
+
+    $port = 2222
+    $sshdConfig = Join-Path $root 'sshd_config'
+    $hostPath = $hostKey.Replace('\', '/')
+    $authorizedPath = $authorized.Replace('\', '/')
+    $configText = @"
+Port $port
+AddressFamily inet
+ListenAddress $address
+HostKey "$hostPath"
+AuthorizedKeysFile "$authorizedPath"
+AllowUsers $account@$($values['admin_ip'])
+AuthenticationMethods publickey
+PasswordAuthentication no
+PermitEmptyPasswords no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+UseDNS no
+"@
+    [IO.File]::WriteAllText($sshdConfig, $configText)
+    & $sshd -t -f $sshdConfig
+    if ($LASTEXITCODE -ne 0) { throw (T $M_SSH_FAIL) }
+
+    $taskName = 'Wgmaint OpenSSH'
+    $oldTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($oldTask) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
+    $oldRule = Get-NetFirewallRule -Name 'Wgmaint-SSH' -ErrorAction SilentlyContinue
+    if ($oldRule) { $oldRule | Remove-NetFirewallRule }
+    New-NetFirewallRule -Name 'Wgmaint-SSH' -DisplayName 'Wgmaint SSH' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -LocalAddress $address -RemoteAddress $values['admin_ip'] -Program $sshd | Out-Null
+    $logFile = Join-Path $root 'sshd.log'
+    $action = New-ScheduledTaskAction -Execute $sshd -Argument ('-D -f "' + $sshdConfig + '" -E "' + $logFile + '"')
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Delay = 'PT30S'
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+    $listening = $false
+    foreach ($attempt in 1..20) {
+        if (Get-NetTCPConnection -State Listen -LocalAddress $address -LocalPort $port -ErrorAction SilentlyContinue) { $listening = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $listening) { throw (T $M_SSH_FAIL) }
+
+    Write-Host (T $M_OK) -ForegroundColor Green
+    Write-Host ('ssh -p ' + $port + ' ' + $account + '@' + $address)
+} catch {
+    Write-Host ((T $M_FAIL) + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+WINDOWS_PS
+
+put /usr/local/bin/wgmaint 0755 root <<'CLI'
+#!/bin/bash
+exec /usr/bin/python3 /usr/local/lib/wgmaint/registry.py "$@"
+CLI
+
+put /etc/systemd/system/wgmaint-firewall.service 0644 root <<'FIREWALL_UNIT'
 [Unit]
-Description=WireGuard 维护网络防火墙
+Description=wgmaint firewall
 After=nftables.service ufw.service firewalld.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nft -f $state/firewall.nft
+ExecStart=/usr/sbin/nft -f /var/lib/wgmaint/firewall.nft
 RemainAfterExit=yes
 FIREWALL_UNIT
 
@@ -581,19 +830,16 @@ Requires=wgmaint-firewall.service
 After=wgmaint-firewall.service
 WG_UNIT
 
-put /etc/systemd/system/wgmaint-registry.service 0644 root <<REGISTRY_UNIT
+put /etc/systemd/system/wgmaint.service 0644 root <<SERVICE_UNIT
 [Unit]
-Description=WireGuard 客户接入登记服务
+Description=wgmaint enrollment service
 BindsTo=wg-quick@$iface.service
 After=wg-quick@$iface.service
-PartOf=wg-quick@$iface.service
 
 [Service]
 User=wgmaint
 Group=wgmaint
-WorkingDirectory=/usr/local/lib/wgmaint
-ExecStartPre=/usr/bin/python3 /usr/local/lib/wgmaint/registry.py restore
-ExecStart=/usr/bin/gunicorn --bind 0.0.0.0:$join_port --workers 2 --timeout 12 --limit-request-line 1024 --limit-request-fields 24 --limit-request-field_size 2048 --certfile $state/join.crt --keyfile $state/join.key registry:application
+ExecStart=/usr/bin/python3 /usr/local/lib/wgmaint/registry.py serve
 Restart=on-failure
 RestartSec=2
 UMask=0077
@@ -601,7 +847,7 @@ AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=$state/db
+ReadWritePaths=$state
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -612,38 +858,40 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
-REGISTRY_UNIT
+SERVICE_UNIT
+
+register_payload="version=2
+join=http://$endpoint:$join_port
+endpoint=$endpoint:$wg_port
+network=$network
+server_public_key=$(cat "$state/server.pub")
+admin_ip=$admin_ip
+admin_private_key=$admin_key
+admin_token=$admin_token"
+put "$state/register.txt" 0640 wgmaint <<<"$register_payload"
 
 systemctl daemon-reload
 if ! nft list table inet wgmaint >/dev/null 2>&1; then
     systemctl restart wgmaint-firewall.service
 fi
-systemctl enable --now "wg-quick@$iface.service" wgmaint-registry.service
+systemctl enable --now "wg-quick@$iface.service"
+systemctl enable --now wgmaint.service
 
 ready=0
-for (( attempt=0; attempt<15; attempt++ )); do
-    if curl --silent --fail --noproxy '*' --max-time 2 --cacert "$state/join.crt" \
-        --connect-to "$endpoint:$join_port:127.0.0.1:$join_port" \
-        "https://$endpoint:$join_port/healthz" >/dev/null; then
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if curl -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$join_port/healthz" >/dev/null 2>&1; then
         ready=1
         break
     fi
     sleep 1
 done
-(( ready )) || die '接入登记服务本机检查失败。运行 journalctl -u wgmaint-registry.service -n 50 查看日志。'
+(( ready )) || die '登记服务本机检查失败。运行 journalctl -u wgmaint.service -n 50 查看日志。'
 [[ $(wg show "$iface" listen-port) == "$wg_port" ]] || die 'WireGuard 监听端口检查失败。'
-[[ $(wg show "$iface" public-key) == "$(cat "$state/server.pub")" ]] || die 'WireGuard 服务器公钥检查失败。'
 
-invitation=$(runuser -u wgmaint -- /usr/bin/python3 /usr/local/lib/wgmaint/registry.py invite)
-put "$state/latest-invite.json" 0600 root <<<"$invitation"
+register_code="WM2:$(printf '%s\n' "$register_payload" | base64 | tr -d '\n')"
 printf '\n部署完成，服务已通过本机检查。\n'
-printf 'WireGuard 公网入口：%s:%s（UDP）\n客户接入地址：https://%s:%s（TCP）\n' "$endpoint" "$wg_port" "$endpoint" "$join_port"
-printf 'VPS 隧道 IP：%s\n管理端隧道 IP：%s\n' "$vps_ip" "$admin_ip"
-if [[ -f $state/admin.conf ]]; then
-    printf 'Mac 的 WireGuard 配置（含私钥）：%s/admin.conf\n' "$state"
-else
-    printf '服务器 WireGuard 公钥：%s\n管理端 AllowedIPs：%s\n' "$(cat "$state/server.pub")" "$network"
-fi
-printf '最新客户接入邀请（15 分钟内有效）：%s/latest-invite.json\n' "$state"
-printf '请确认 VPS 防火墙和云安全组放行入站 UDP %s、TCP %s，并允许管理端通过 %s 转发 SSH 到客户机。\n' "$wg_port" "$join_port" "$iface"
+printf 'WireGuard 入口：%s:%s（UDP）\n客户接入入口：http://%s:%s（TCP）\n' "$endpoint" "$wg_port" "$endpoint" "$join_port"
+printf 'VPS 隧道 IP：%s\n管理端隧道 IP：%s\n\n' "$vps_ip" "$admin_ip"
+printf '登记码（复制下面这一整行，回 Mac 点「新客户接入」时粘贴一次）：\n%s\n\n' "$register_code"
+printf '请确认云安全组放行入站 UDP %s、TCP %s。\n' "$wg_port" "$join_port"
 WGMAINT_DEPLOY
