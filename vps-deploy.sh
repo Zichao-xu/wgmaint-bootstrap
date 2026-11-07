@@ -319,7 +319,7 @@ PORT = 8443
 WG_PORT = 51820
 TTL = 7200
 MAX_UPLOAD = 80 * 1024 * 1024
-PKG_NAME = "windows.msi"
+PKG_NAMES = ("windows.msi", "openssh.zip")
 PKG_DIR = STATE / "pkg"
 SERVER_VERSION = "wgmaint/2"
 
@@ -382,8 +382,8 @@ def restore_peers():
             wg_apply(public_key, address)
 
 
-def package_path():
-    return PKG_DIR / PKG_NAME
+def package_path(name):
+    return PKG_DIR / name
 
 
 def package_digest(path):
@@ -485,10 +485,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_body(200, b"ok\n")
             if path == "/v1/reports":
                 return self.reports()
-            if path == "/v1/package/" + PKG_NAME:
+            match = re.fullmatch(r"/v1/package/([A-Za-z0-9.]+)", path)
+            if match and match.group(1) in PKG_NAMES:
                 if not self.authorized():
                     return self.send_body(403, b"forbidden\n")
-                package = package_path()
+                package = package_path(match.group(1))
                 if not package.is_file():
                     return self.send_body(404, b"missing\n")
                 status = "size=%d\nsha256=%s\n" % (package.stat().st_size, package_digest(package))
@@ -496,9 +497,9 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/j/([A-Za-z0-9_-]{22})", path)
             if match:
                 return self.join_script(match.group(1))
-            match = re.fullmatch(r"/j/([A-Za-z0-9_-]{22})/pkg/" + re.escape(PKG_NAME), path)
-            if match:
-                return self.package(match.group(1))
+            match = re.fullmatch(r"/j/([A-Za-z0-9_-]{22})/pkg/([A-Za-z0-9.]+)", path)
+            if match and match.group(2) in PKG_NAMES:
+                return self.package(match.group(1), match.group(2))
             return self.send_body(404, b"not found\n")
         except OSError as error:
             print("读取文件失败：%s" % type(error).__name__, file=sys.stderr)
@@ -513,8 +514,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.enroll()
             if path == "/v1/report":
                 return self.report()
-            if path == "/v1/package/" + PKG_NAME:
-                return self.upload()
+            match = re.fullmatch(r"/v1/package/([A-Za-z0-9.]+)", path)
+            if match and match.group(1) in PKG_NAMES:
+                return self.upload(match.group(1))
             return self.send_body(404, b"not found\n")
         except (ValueError, UnicodeError):
             return self.send_body(400, b"bad request\n")
@@ -529,24 +531,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_body(404, b"expired\n")
         if row[0] != "windows":
             return self.send_body(404, b"unsupported\n")
-        package = package_path()
-        if not package.is_file():
+        msi = package_path("windows.msi")
+        ssh = package_path("openssh.zip")
+        if not msi.is_file() or not ssh.is_file():
             return self.send_body(503, b"package missing\n")
         template = Path(__file__).with_name("join-windows.ps1").read_text()
         body = (template
                 .replace("__JOIN__", origin())
                 .replace("__CODE__", code)
                 .replace("__SSHKEY__", row[1])
-                .replace("__MSISIZE__", str(package.stat().st_size))
-                .replace("__MSISHA__", package_digest(package)))
+                .replace("__MSISIZE__", str(msi.stat().st_size))
+                .replace("__MSISHA__", package_digest(msi))
+                .replace("__SSHSIZE__", str(ssh.stat().st_size))
+                .replace("__SSHSHA__", package_digest(ssh)))
         return self.send_body(200, body.encode("ascii"))
 
-    def package(self, code):
+    def package(self, code, name):
         with closing(db_connect()) as db:
             row = db.execute("SELECT expires FROM codes WHERE code = ?", (code,)).fetchone()
         if not row or row[0] <= time.time():
             return self.send_body(404, b"expired\n")
-        path = package_path()
+        path = package_path(name)
         if not path.is_file():
             return self.send_body(503, b"package missing\n")
         return self.send_body(200, path.read_bytes(), "application/octet-stream")
@@ -602,7 +607,7 @@ class Handler(BaseHTTPRequestHandler):
             address, settings()["endpoint"], WG_PORT, server_public_key(), admin_ip())
         return self.send_body(200, body.encode("ascii"))
 
-    def upload(self):
+    def upload(self, name):
         if not self.authorized():
             return self.send_body(403, b"forbidden\n")
         try:
@@ -614,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
         data = self.rfile.read(length)
         if len(data) != length:
             return self.send_body(400, b"short read\n")
-        package = package_path()
+        package = package_path(name)
         temporary = PKG_DIR / (".upload-" + secrets.token_hex(6))
         temporary.write_bytes(data)
         temporary.chmod(0o640)
@@ -649,6 +654,8 @@ $code = '__CODE__'
 $sshKey = '__SSHKEY__'
 $msiSha = '__MSISHA__'
 $msiSize = __MSISIZE__
+$sshZipSha = '__SSHSHA__'
+$sshZipSize = __SSHSIZE__
 $stage = 'start'
 
 function T([string] $value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
@@ -819,24 +826,23 @@ PersistentKeepalive = 25
 
     $stage = 'sshd'
     Write-Host (T $M_SSH)
-    $sshd = Join-Path $env:windir 'System32\OpenSSH\sshd.exe'
-    if (-not (Test-Path -LiteralPath $sshd)) {
-        $defaultRule = 'OpenSSH-Server-In-TCP'
-        $hadRule = Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue
+    $sshd = Join-Path $root 'openssh\sshd.exe'
+    $keygen = Join-Path $root 'openssh\ssh-keygen.exe'
+    if (-not (Test-Path -LiteralPath $sshd) -or -not (Test-Path -LiteralPath $keygen)) {
+        $zip = Join-Path $root 'openssh.zip'
+        $folder = Join-Path $root 'openssh'
         try {
-            $capability = Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
-            if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; Read-Host (T $M_PAUSE); exit 0 }
+            Invoke-WebRequest -UseBasicParsing -Uri ($join + '/j/' + $code + '/pkg/openssh.zip') -OutFile $zip
+            if ((Get-Item -LiteralPath $zip).Length -ne $sshZipSize) { throw (T $M_SSH_FAIL) }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash -ne $sshZipSha) { throw (T $M_SSH_FAIL) }
+            if (Test-Path -LiteralPath $folder) { Remove-Item -LiteralPath $folder -Recurse -Force }
+            Expand-Archive -LiteralPath $zip -DestinationPath $root -Force
+            Move-Item -LiteralPath (Join-Path $root 'OpenSSH-Win64') -Destination $folder -Force
         } finally {
-            if (-not $hadRule) { Get-NetFirewallRule -Name $defaultRule -ErrorAction SilentlyContinue | Disable-NetFirewallRule }
+            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
         }
     }
-    if (-not (Test-Path -LiteralPath $sshd)) { throw (T $M_SSH_FAIL) }
-    $keygen = Join-Path $env:windir 'System32\OpenSSH\ssh-keygen.exe'
-    if (-not (Test-Path -LiteralPath $keygen)) {
-        $capability = Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0'
-        if ($capability.RestartNeeded) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; Read-Host (T $M_PAUSE); exit 0 }
-    }
-    if (-not (Test-Path -LiteralPath $keygen)) { throw (T $M_SSH_FAIL) }
+    if (-not (Test-Path -LiteralPath $sshd) -or -not (Test-Path -LiteralPath $keygen)) { throw (T $M_SSH_FAIL) }
 
     $stage = 'account'
     $account = 'wgmaint-ssh'

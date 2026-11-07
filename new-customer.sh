@@ -7,12 +7,14 @@ export LC_ALL=en_US.UTF-8
 CONFIG_DIR="$HOME/.wgmaint"
 DEFAULT_MSI="$HOME/.win-clients/pkg/wireguard-amd64-1.1.1.msi"
 DEFAULT_KEY="$HOME/.ssh/id_ed25519.pub"
+DEFAULT_SSH_ZIP="$HOME/.win-clients/pkg/OpenSSH-Win64-v8.1.zip"
 
 VPS_TARGET=""
 COPY=0
 PLATFORM="windows"
 KEY="$DEFAULT_KEY"
 MSI="$DEFAULT_MSI"
+SSH_ZIP="$DEFAULT_SSH_ZIP"
 FORCE_REGISTER=0
 SKIP_WG=0
 REPORTS=0
@@ -62,6 +64,10 @@ while [ $# -gt 0 ]; do
             MSI=$2
             shift 2
             ;;
+        --ssh-zip)
+            SSH_ZIP=$2
+            shift 2
+            ;;
         --register)
             FORCE_REGISTER=1
             shift
@@ -93,6 +99,7 @@ fi
 if [ "$REPORTS" -eq 0 ]; then
     [ -f "$KEY" ] || die "找不到 SSH 公钥：$KEY"
     [ -f "$MSI" ] || die "找不到 WireGuard 安装包：$MSI"
+    [ -f "$SSH_ZIP" ] || die "找不到 OpenSSH 安装包：$SSH_ZIP"
 fi
 
 vps_id=$(printf '%s' "$VPS_TARGET" | shasum -a 256 | cut -c1-8)
@@ -274,19 +281,24 @@ EOF
     die "启动维护隧道失败：$tail_text"
 }
 
-ensure_package() {
-    local status remote_sha local_sha response
-    status=$(curl -fsS --max-time 10 -H "Authorization: Bearer $CFG_ADMIN_TOKEN" "$CFG_JOIN/v1/package/windows.msi" 2>/dev/null || true)
+upload_package() {
+    local name=$1 path=$2 status remote_sha local_sha
+    status=$(curl -fsS --max-time 10 -H "Authorization: Bearer $CFG_ADMIN_TOKEN" "$CFG_JOIN/v1/package/$name" 2>/dev/null || true)
     if [ -n "$status" ]; then
         remote_sha=$(printf '%s\n' "$status" | sed -n 's/^sha256=//p')
-        local_sha=$(shasum -a 256 "$MSI" | cut -d' ' -f1)
+        local_sha=$(shasum -a 256 "$path" | cut -d' ' -f1)
         if [ "$remote_sha" = "$local_sha" ]; then
             return 0
         fi
     fi
-    response=$(curl -fsS --max-time 180 -H "Authorization: Bearer $CFG_ADMIN_TOKEN" --data-binary @"$MSI" "$CFG_JOIN/v1/package/windows.msi" 2>/dev/null) ||
-        die "上传 WireGuard 安装包失败，请检查维护 VPS 的 TCP 8443 是否放行。"
-    printf '已上传 WireGuard 安装包。\n'
+    curl -fsS --max-time 300 -H "Authorization: Bearer $CFG_ADMIN_TOKEN" --data-binary @"$path" "$CFG_JOIN/v1/package/$name" >/dev/null 2>&1 ||
+        die "上传 $name 失败，请检查维护 VPS 的 TCP 8443 是否放行。"
+    printf '已上传 %s。\n' "$name"
+}
+
+ensure_package() {
+    upload_package windows.msi "$MSI"
+    upload_package openssh.zip "$SSH_ZIP"
 }
 
 issue_code() {
