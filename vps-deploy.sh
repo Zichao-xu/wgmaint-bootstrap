@@ -684,6 +684,34 @@ function Report([string] $message) {
     }
 }
 
+function Set-SecureDirectoryAcl([string] $path) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sidText in @('S-1-5-18', 'S-1-5-32-544')) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidText)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $path -AclObject $acl
+}
+
+function Set-SecureFileAcl([string] $path, [string[]] $extraReadSids) {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sidText in @('S-1-5-18', 'S-1-5-32-544')) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidText)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    foreach ($sidText in $extraReadSids) {
+        if (-not $sidText) { continue }
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidText)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Read', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $path -AclObject $acl
+}
+
 function Stop-WithPause([string] $message) {
     Write-Host ((T $M_FAIL) + $message) -ForegroundColor Red
     try { Set-Clipboard -Value $message | Out-Null } catch {
@@ -715,7 +743,7 @@ try {
 
     $root = Join-Path $env:ProgramData 'Wgmaint'
     if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root | Out-Null }
-    & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    Set-SecureDirectoryAcl $root
 
     $stage = 'wireguard'
     Write-Host (T $M_WG)
@@ -868,11 +896,11 @@ PersistentKeepalive = 25
         if ($created.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $hostKey)) { throw (T $M_SSH_FAIL) }
     }
     & takeown.exe /f $hostKey /a | Out-Null
-    & icacls.exe $hostKey /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+    Set-SecureFileAcl $hostKey @()
     $authorized = Join-Path $root 'authorized_keys'
     [IO.File]::WriteAllText($authorized, ('from="' + $values['admin_ip'] + '",restrict,pty ' + $sshKey + [char]10))
     & takeown.exe /f $authorized /a | Out-Null
-    & icacls.exe $authorized /inheritance:r /grant:r ('*' + $user.SID.Value + ':R') /grant:r '*S-1-5-18:F' /grant:r '*S-1-5-32-544:F' | Out-Null
+    Set-SecureFileAcl $authorized @([string] $user.SID.Value)
 
     $stage = 'sshd_config'
     $port = 2222
@@ -896,7 +924,7 @@ UseDNS no
 "@
     [IO.File]::WriteAllText($sshdConfig, $configText)
     & takeown.exe /f $sshdConfig /a | Out-Null
-    & icacls.exe $sshdConfig /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+    Set-SecureFileAcl $sshdConfig @()
     & $sshd -t -f $sshdConfig
     if ($LASTEXITCODE -ne 0) { throw (T $M_SSH_FAIL) }
 
@@ -953,6 +981,10 @@ UseDNS no
         if ($procs) { $detail = $detail + ' sshd_pid=' + ($procs.Id -join ',') }
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc) { $detail = $detail + ' service=' + $svc.Status }
+        try { $detail = $detail + ' key_acl=' + ((Get-Acl -LiteralPath $hostKey).Sddl) } catch {
+        }
+        try { $detail = $detail + ' dir_acl=' + ((Get-Acl -LiteralPath $root).Sddl) } catch {
+        }
         throw ((T $M_SSH_FAIL) + $detail)
     }
     Write-Host (T $M_OK) -ForegroundColor Green
