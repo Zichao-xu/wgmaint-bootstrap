@@ -867,8 +867,11 @@ PersistentKeepalive = 25
         $created = Start-Process -FilePath $keygen -ArgumentList @('-q', '-t', 'ed25519', '-N', '""', '-f', $hostKey) -Wait -PassThru -NoNewWindow
         if ($created.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $hostKey)) { throw (T $M_SSH_FAIL) }
     }
+    & takeown.exe /f $hostKey /a | Out-Null
+    & icacls.exe $hostKey /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
     $authorized = Join-Path $root 'authorized_keys'
     [IO.File]::WriteAllText($authorized, ('from="' + $values['admin_ip'] + '",restrict,pty ' + $sshKey + [char]10))
+    & takeown.exe /f $authorized /a | Out-Null
     & icacls.exe $authorized /inheritance:r /grant:r ('*' + $user.SID.Value + ':R') /grant:r '*S-1-5-18:F' /grant:r '*S-1-5-32-544:F' | Out-Null
 
     $stage = 'sshd_config'
@@ -892,6 +895,8 @@ PermitTunnel no
 UseDNS no
 "@
     [IO.File]::WriteAllText($sshdConfig, $configText)
+    & takeown.exe /f $sshdConfig /a | Out-Null
+    & icacls.exe $sshdConfig /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
     & $sshd -t -f $sshdConfig
     if ($LASTEXITCODE -ne 0) { throw (T $M_SSH_FAIL) }
 
