@@ -199,7 +199,7 @@ obtain_registration() {
             REGISTER=$output
             return 0
         fi
-        output=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$VPS_TARGET" 'sudo -n /usr/local/bin/wgmaint invite' </dev/null 2>/dev/null || true)
+        output=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$VPS_TARGET" 'sudo -n /usr/local/bin/wgmaint invite' </dev/null 2>/dev/null || true)
         output=$(printf '%s\n' "$output" | grep -m1 '^WM2:' || true)
         if [ -n "$output" ]; then
             REGISTER=$output

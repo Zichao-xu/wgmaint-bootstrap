@@ -607,6 +607,7 @@ $code = '__CODE__'
 $sshKey = '__SSHKEY__'
 $msiSha = '__MSISHA__'
 $msiSize = __MSISIZE__
+[System.Net.WebRequest]::DefaultWebProxy = $null
 
 function T([string] $value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
 $M_ELEVATE = '5q2j5Zyo6K+35rGC566h55CG5ZGY5p2D6ZmQ77yM6K+35Zyo5by556qX5Lit54K544CM5piv44CN44CC'
