@@ -317,7 +317,7 @@ STATE = Path("/var/lib/wgmaint")
 IFACE = "wgmaint0"
 PORT = 8443
 WG_PORT = 51820
-TTL = 7200
+TTL = 86400
 MAX_UPLOAD = 80 * 1024 * 1024
 PKG_NAMES = ("windows.msi", "openssh.zip")
 PKG_DIR = STATE / "pkg"
@@ -646,7 +646,8 @@ if __name__ == "__main__":
 REGISTRY
 
 put /usr/local/lib/wgmaint/join-windows.ps1 0644 root <<'WINDOWS_PS'
-# Wgmaint Windows onboarding. ASCII only; Chinese text is Base64 UTF-8.
+# Wgmaint Windows onboarding: one paste, self-retry, reboot auto-resume.
+# ASCII only; Chinese text is Base64 UTF-8.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $join = '__JOIN__'
@@ -657,6 +658,11 @@ $msiSize = __MSISIZE__
 $sshZipSha = '__SSHSHA__'
 $sshZipSize = __SSHSIZE__
 $stage = 'start'
+$root = Join-Path $env:ProgramData 'Wgmaint'
+$resumeMarker = Join-Path $root 'resume.pending'
+$resumeTask = 'Wgmaint Resume'
+$interactive = $true
+if (Test-Path -LiteralPath $resumeMarker) { $interactive = $false }
 
 function T([string] $value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
 $M_ELEVATE = '5q2j5Zyo6K+35rGC566h55CG5ZGY5p2D6ZmQ77yM6K+35Zyo5by556qX5Lit54K544CM5piv44CN44CC'
@@ -665,9 +671,9 @@ $M_WG = '5q2j5Zyo5a6J6KOFIFdpcmVHdWFyZC4uLg=='
 $M_ENROLL = '5q2j5Zyo55m76K6w6Zqn6YGTLi4u'
 $M_SSH = '5q2j5Zyo6YWN572uIFNTSC4uLg=='
 $M_OK = '5o6l5YWl5oiQ5Yqf77yB5Zyo57u05oqkIE1hYyDkuIrmiafooYzvvJo='
-$M_REBOOT = '5a6J6KOF6ZyA6KaB6YeN5ZCv44CC6K+36YeN5ZCv55S16ISR5ZCO6YeN5paw57KY6LS05ZCM5LiA5p2h5ZG95Luk44CC'
+$M_REBOOT = '6ZyA6KaB6YeN5ZCv57O757uf44CC6YeN5ZCv5ZCO5Lya6Ieq5Yqo57un57ut5a6J6KOF77yM5LiN6ZyA6KaB5YaN57KY6LS05ZG95Luk44CC'
 $M_HANDSHAKE = 'V2lyZUd1YXJkIOacquWujOaIkOaPoeaJi++8jOivt+ajgOafpeWuouaIt+acuue9kee7nOWQjumHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
-$M_SSH_FAIL = 'T3BlblNTSCDmnI3liqHlmajlkK/liqjlpLHotKXjgII='
+$M_SSH_FAIL = 'T3BlblNTSCDmnI3liqHlkK/liqjlpLHotKXjgII='
 $M_FAIL = '5o6l5YWl5aSx6LSl44CC'
 $M_ACCOUNT = '57u05oqk6LSm5Y+35bey5a2Y5Zyo5L2G5LiN5Y+X5pys5bel5YW3566h55CG77yM5bey5YGc5q2i44CC'
 $M_MSI_BAD = 'V2lyZUd1YXJkIOWuieijheWMheagoemqjOWksei0pe+8jOivt+mHjeaWsOeymOi0tOWQjOS4gOadoeWRveS7pOOAgg=='
@@ -682,6 +688,44 @@ function Report([string] $message) {
         Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Method Post -Uri ($join + '/v1/report') -ContentType 'application/x-www-form-urlencoded' -Body $body | Out-Null
     } catch {
     }
+}
+
+function Pause-IfInteractive {
+    if ($interactive) {
+        try { Read-Host (T $M_PAUSE) } catch {
+        }
+    }
+}
+
+function Get-Retry([string] $uri, [string] $outFile, [int] $attempts) {
+    for ($i = 1; $i -le $attempts; $i++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -TimeoutSec 180 -Uri $uri -OutFile $outFile
+            return
+        } catch {
+            if ($i -eq $attempts) { throw }
+            Start-Sleep -Seconds (3 * $i)
+        }
+    }
+}
+
+function Register-Resume {
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    [IO.File]::WriteAllText($resumeMarker, 'pending')
+    $old = Get-ScheduledTask -TaskName $resumeTask -ErrorAction SilentlyContinue
+    if ($old) { Unregister-ScheduledTask -TaskName $resumeTask -Confirm:$false }
+    $argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "iex(irm ''' + $join + '/j/' + $code + ''')"'
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Delay = 'PT2M'
+    $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 2) -StartWhenAvailable
+    Register-ScheduledTask -TaskName $resumeTask -Action $action -Trigger $trigger -Settings $taskSettings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+}
+
+function Clear-Resume {
+    $old = Get-ScheduledTask -TaskName $resumeTask -ErrorAction SilentlyContinue
+    if ($old) { Unregister-ScheduledTask -TaskName $resumeTask -Confirm:$false }
+    Remove-Item -LiteralPath $resumeMarker -Force -ErrorAction SilentlyContinue
 }
 
 function Set-SecureDirectoryAcl([string] $path) {
@@ -716,8 +760,7 @@ function Stop-WithPause([string] $message) {
     Write-Host ((T $M_FAIL) + $message) -ForegroundColor Red
     try { Set-Clipboard -Value $message | Out-Null } catch {
     }
-    try { Read-Host (T $M_PAUSE) } catch {
-    }
+    Pause-IfInteractive
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -725,7 +768,7 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host (T $M_ELEVATE) -ForegroundColor Yellow
     try {
-        $arguments = '-NoExit -Command "iex(irm ''' + $join + '/j/' + $code + ''')"'
+        $arguments = '-NoExit -Command "try{iex(irm ''' + $join + '/j/' + $code + ''')}catch{Write-Host (T $M_FAIL);Read-Host (T $M_PAUSE)}"'
         Start-Process powershell -Verb RunAs -ArgumentList $arguments
     } catch {
         Stop-WithPause $_.Exception.Message
@@ -741,7 +784,6 @@ try {
         throw (T $M_OS)
     }
 
-    $root = Join-Path $env:ProgramData 'Wgmaint'
     if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root | Out-Null }
     Set-SecureDirectoryAcl $root
 
@@ -752,17 +794,28 @@ try {
     if (-not (Test-Path -LiteralPath $wg)) {
         $msi = Join-Path $root 'wireguard.msi'
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri ($join + '/j/' + $code + '/pkg/windows.msi') -OutFile $msi
+            Get-Retry ($join + '/j/' + $code + '/pkg/windows.msi') $msi 3
             if ((Get-Item -LiteralPath $msi).Length -ne $msiSize) { throw (T $M_MSI_BAD) }
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath $msi).Hash -ne $msiSha) { throw (T $M_MSI_BAD) }
             $installer = Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart', 'DO_NOT_LAUNCH=1') -Wait -PassThru
-            if ($installer.ExitCode -eq 3010) { Write-Host (T $M_REBOOT) -ForegroundColor Yellow; Read-Host (T $M_PAUSE); exit 0 }
+            if ($installer.ExitCode -eq 3010) {
+                Register-Resume
+                Write-Host (T $M_REBOOT) -ForegroundColor Yellow
+                Report ('reboot-required ' + $stage)
+                Pause-IfInteractive
+                exit 0
+            }
             if ($installer.ExitCode -ne 0) { throw ((T $M_WG_FAIL) + ' (' + $installer.ExitCode + ')') }
         } finally {
             Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
         }
     }
     if (-not (Test-Path -LiteralPath $wg) -or -not (Test-Path -LiteralPath $wireguard)) { throw (T $M_WG_FAIL) }
+    $driver = Get-Service -Name 'WireGuard' -ErrorAction SilentlyContinue
+    if ($driver -and $driver.Status -ne 'Running') {
+        try { Start-Service -Name 'WireGuard' -ErrorAction Stop } catch {
+        }
+    }
 
     $stage = 'key'
     $keyFile = Join-Path $root 'wireguard.key'
@@ -778,7 +831,16 @@ try {
     $stage = 'enroll'
     Write-Host (T $M_ENROLL)
     $body = 'code=' + [Uri]::EscapeDataString($code) + '&public_key=' + [Uri]::EscapeDataString($public)
-    $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri ($join + '/v1/enroll') -ContentType 'application/x-www-form-urlencoded' -Body $body
+    $response = $null
+    for ($i = 1; $i -le 3; $i++) {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 30 -Method Post -Uri ($join + '/v1/enroll') -ContentType 'application/x-www-form-urlencoded' -Body $body
+            break
+        } catch {
+            if ($i -eq 3) { throw }
+            Start-Sleep -Seconds (3 * $i)
+        }
+    }
     $values = @{}
     foreach ($line in [Regex]::Split($response.Content, '[\r\n]+')) {
         if ($line -match '^([a-z_]+)=(.*)$') { $values[$matches[1]] = $matches[2] }
@@ -802,55 +864,31 @@ Endpoint = $($values['endpoint'])
 PersistentKeepalive = 25
 "@
     [IO.File]::WriteAllText($config, $text)
-
-    $driver = Get-Service -Name 'WireGuard' -ErrorAction SilentlyContinue
-    if ($driver -and $driver.Status -ne 'Running') {
-        try { Start-Service -Name 'WireGuard' -ErrorAction Stop } catch {
-        }
-    }
-    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-        & $wireguard /uninstalltunnelservice $tunnel | Out-Null
-        Start-Sleep -Seconds 2
-    }
-    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-        & sc.exe delete $serviceName | Out-Null
-        Start-Sleep -Seconds 1
-    }
-    $installOut = Join-Path $root 'tunnel-install.out'
-    $installErr = Join-Path $root 'tunnel-install.err'
-    $install = Start-Process -FilePath $wireguard -ArgumentList @('/installtunnelservice', $config) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $installOut -RedirectStandardError $installErr
-    if ($install.ExitCode -ne 0) {
-        $detail = ''
-        foreach ($file in @($installOut, $installErr)) {
-            if (Test-Path -LiteralPath $file) {
-                $detail = $detail + (Get-Content -LiteralPath $file -Raw -ErrorAction SilentlyContinue)
-            }
-        }
-        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if ($service) { $detail = $detail + ' service=' + $service.Status }
-        try {
-            $events = Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 200 -ErrorAction Stop |
-                Where-Object { $_.ProviderName -match 'WireGuard|Service Control Manager' } |
-                Select-Object -First 3
-            foreach ($event in $events) { $detail = $detail + ' | ' + $event.ProviderName + ': ' + $event.Message }
-        } catch {
-        }
-        throw ((T $M_TUNNEL_FAIL) + 'exit=' + $install.ExitCode + ' ' + $detail)
-    }
-    $address = $values['address'].Split('/')[0]
+    Set-SecureFileAcl $config @()
     $tunnelOk = $false
-    foreach ($attempt in 1..45) {
-        $handshake = & $wg show $tunnel latest-handshakes 2>$null
-        if ($LASTEXITCODE -eq 0 -and $handshake -match '\s[1-9][0-9]*\s*$' -and
-            (Get-NetIPAddress -IPAddress $address -ErrorAction SilentlyContinue)) { $tunnelOk = $true; break }
-        Start-Sleep -Seconds 1
+    foreach ($round in 1..2) {
+        $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($existing) {
+            & $wireguard /uninstalltunnelservice $tunnel | Out-Null
+            Start-Sleep -Seconds 2
+        }
+        if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+            & sc.exe delete $serviceName | Out-Null
+            Start-Sleep -Seconds 1
+        }
+        & $wireguard /installtunnelservice $config | Out-Null
+        Start-Sleep -Seconds 2
+        $address = $values['address'].Split('/')[0]
+        foreach ($attempt in 1..30) {
+            $handshake = & $wg show $tunnel latest-handshakes 2>$null
+            if ($LASTEXITCODE -eq 0 -and $handshake -match '\s[1-9][0-9]*\s*$' -and
+                (Get-NetIPAddress -IPAddress $address -ErrorAction SilentlyContinue)) { $tunnelOk = $true; break }
+            Start-Sleep -Seconds 1
+        }
+        if ($tunnelOk) { break }
+        Start-Sleep -Seconds 3
     }
-    if (-not $tunnelOk) {
-        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        $state = 'unknown'
-        if ($service) { $state = $service.Status }
-        throw ((T $M_HANDSHAKE) + ' service=' + $state)
-    }
+    if (-not $tunnelOk) { throw (T $M_TUNNEL_FAIL) }
 
     $stage = 'sshd'
     Write-Host (T $M_SSH)
@@ -860,7 +898,7 @@ PersistentKeepalive = 25
         $zip = Join-Path $root 'openssh.zip'
         $folder = Join-Path $root 'openssh'
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri ($join + '/j/' + $code + '/pkg/openssh.zip') -OutFile $zip
+            Get-Retry ($join + '/j/' + $code + '/pkg/openssh.zip') $zip 3
             if ((Get-Item -LiteralPath $zip).Length -ne $sshZipSize) { throw (T $M_SSH_FAIL) }
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash -ne $sshZipSha) { throw (T $M_SSH_FAIL) }
             if (Test-Path -LiteralPath $folder) { Remove-Item -LiteralPath $folder -Recurse -Force }
@@ -958,7 +996,7 @@ UseDNS no
         $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $taskSettings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
         Start-ScheduledTask -TaskName $taskName
-        foreach ($attempt in 1..15) {
+        foreach ($attempt in 1..20) {
             if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) { $started = $true; break }
             Start-Sleep -Seconds 1
         }
@@ -967,7 +1005,7 @@ UseDNS no
     if (-not $started) {
         & sc.exe create $svcName binPath= ('"' + $sshd + '" ' + $sshdArgs) start= auto obj= LocalSystem DisplayName= 'Wgmaint SSH' | Out-Null
         & sc.exe start $svcName | Out-Null
-        foreach ($attempt in 1..15) {
+        foreach ($attempt in 1..20) {
             if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) { $started = $true; break }
             Start-Sleep -Seconds 1
         }
@@ -977,16 +1015,12 @@ UseDNS no
         if (Test-Path -LiteralPath $logFile) { $detail = $detail + (Get-Content -LiteralPath $logFile -Raw -ErrorAction SilentlyContinue) }
         $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo
         if ($taskInfo) { $detail = $detail + ' task=' + $taskInfo.LastTaskResult }
-        $procs = Get-Process -Name sshd -ErrorAction SilentlyContinue
-        if ($procs) { $detail = $detail + ' sshd_pid=' + ($procs.Id -join ',') }
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc) { $detail = $detail + ' service=' + $svc.Status }
-        try { $detail = $detail + ' key_acl=' + ((Get-Acl -LiteralPath $hostKey).Sddl) } catch {
-        }
-        try { $detail = $detail + ' dir_acl=' + ((Get-Acl -LiteralPath $root).Sddl) } catch {
-        }
         throw ((T $M_SSH_FAIL) + $detail)
     }
+
+    Clear-Resume
     Write-Host (T $M_OK) -ForegroundColor Green
     Write-Host ('ssh -p ' + $port + ' ' + $account + '@' + $address)
     Report ('ok ' + $address)
@@ -997,8 +1031,7 @@ UseDNS no
     Report ($stage + ': ' + $detail)
     try { Set-Clipboard -Value ($stage + ': ' + $detail) | Out-Null } catch {
     }
-    try { Read-Host (T $M_PAUSE) } catch {
-    }
+    Pause-IfInteractive
 }
 
 WINDOWS_PS

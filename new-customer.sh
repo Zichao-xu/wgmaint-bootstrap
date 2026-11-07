@@ -370,7 +370,7 @@ length=$(printf '%s' "$COMMAND" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')
 
 if [ "$COPY" -eq 1 ]; then
     printf '%s' "$COMMAND" | pbcopy
-    notify "已复制 Windows 接入命令（2 小时内有效）。到客户机粘贴执行，结束后从这台 Mac 执行 ssh -p 2222 wgmaint-ssh@隧道IP 登录。"
+    notify "已复制 Windows 接入命令（24 小时内有效）。到客户机粘贴执行，结束后从这台 Mac 执行 ssh -p 2222 wgmaint-ssh@隧道IP 登录。"
     printf '已复制 Windows 接入命令（%s 字符）。\n' "$length"
 else
     printf '%s\n' "$COMMAND"
