@@ -1041,14 +1041,33 @@ put /usr/local/bin/wgmaint 0755 root <<'CLI'
 exec /usr/bin/python3 /usr/local/lib/wgmaint/registry.py "$@"
 CLI
 
+# 访问控制只在 nft inet wgmaint 表里做；但 nft 的 accept 只在本表生效，
+# 宿主机若有别家的 FORWARD DROP（Docker/ufw/firewalld，iptables-nft 表），包仍会被丢。
+# 这里只放行 wgmaint0 内部转发越过它们，探测到 iptables 才加，没有就跳过。
+put /usr/local/lib/wgmaint/fw-passthru.sh 0755 root <<PASSTHRU
+#!/bin/sh
+for t in iptables ip6tables; do
+    command -v \$t >/dev/null 2>&1 || continue
+    if [ "\$1" = stop ]; then
+        \$t -D FORWARD -i $iface -o $iface -j ACCEPT 2>/dev/null
+    else
+        \$t -C FORWARD -i $iface -o $iface -j ACCEPT 2>/dev/null ||
+            \$t -I FORWARD 1 -i $iface -o $iface -j ACCEPT
+    fi
+done
+exit 0
+PASSTHRU
+
 put /etc/systemd/system/wgmaint-firewall.service 0644 root <<'FIREWALL_UNIT'
 [Unit]
 Description=wgmaint firewall
-After=nftables.service ufw.service firewalld.service
+After=nftables.service ufw.service firewalld.service docker.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/nft -f /var/lib/wgmaint/firewall.nft
+ExecStartPost=/usr/local/lib/wgmaint/fw-passthru.sh
+ExecStop=/usr/local/lib/wgmaint/fw-passthru.sh stop
 RemainAfterExit=yes
 FIREWALL_UNIT
 
