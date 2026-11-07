@@ -667,6 +667,7 @@ $M_MSI_BAD = 'V2lyZUd1YXJkIOWuieijheWMheagoemqjOWksei0pe+8jOivt+mHjeaWsOeymOi0tO
 $M_WG_FAIL = 'V2lyZUd1YXJkIOWuieijheWksei0peOAgg=='
 $M_STAGE = '5b2T5YmN5q2l6aqk77ya'
 $M_PAUSE = '6K+35oyJ5Zue6L2m6ZSu5YWz6Zet56qX5Y+j44CC'
+$M_TUNNEL_FAIL = 'V2lyZUd1YXJkIOmap+mBk+WuieijheWksei0peOAgg=='
 
 function Report([string] $message) {
     try {
@@ -766,10 +767,41 @@ Endpoint = $($values['endpoint'])
 PersistentKeepalive = 25
 "@
     [IO.File]::WriteAllText($config, $text)
-    $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($existing) { & $wireguard /uninstalltunnelservice $tunnel | Out-Null }
-    & $wireguard /installtunnelservice $config | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw (T $M_WG_FAIL) }
+
+    $driver = Get-Service -Name 'WireGuard' -ErrorAction SilentlyContinue
+    if ($driver -and $driver.Status -ne 'Running') {
+        try { Start-Service -Name 'WireGuard' -ErrorAction Stop } catch {
+        }
+    }
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        & $wireguard /uninstalltunnelservice $tunnel | Out-Null
+        Start-Sleep -Seconds 2
+    }
+    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+        & sc.exe delete $serviceName | Out-Null
+        Start-Sleep -Seconds 1
+    }
+    $installOut = Join-Path $root 'tunnel-install.out'
+    $installErr = Join-Path $root 'tunnel-install.err'
+    $install = Start-Process -FilePath $wireguard -ArgumentList @('/installtunnelservice', $config) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $installOut -RedirectStandardError $installErr
+    if ($install.ExitCode -ne 0) {
+        $detail = ''
+        foreach ($file in @($installOut, $installErr)) {
+            if (Test-Path -LiteralPath $file) {
+                $detail = $detail + (Get-Content -LiteralPath $file -Raw -ErrorAction SilentlyContinue)
+            }
+        }
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($service) { $detail = $detail + ' service=' + $service.Status }
+        try {
+            $events = Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-10)} -MaxEvents 200 -ErrorAction Stop |
+                Where-Object { $_.ProviderName -match 'WireGuard|Service Control Manager' } |
+                Select-Object -First 3
+            foreach ($event in $events) { $detail = $detail + ' | ' + $event.ProviderName + ': ' + $event.Message }
+        } catch {
+        }
+        throw ((T $M_TUNNEL_FAIL) + 'exit=' + $install.ExitCode + ' ' + $detail)
+    }
     $address = $values['address'].Split('/')[0]
     $tunnelOk = $false
     foreach ($attempt in 1..45) {
@@ -778,7 +810,12 @@ PersistentKeepalive = 25
             (Get-NetIPAddress -IPAddress $address -ErrorAction SilentlyContinue)) { $tunnelOk = $true; break }
         Start-Sleep -Seconds 1
     }
-    if (-not $tunnelOk) { throw (T $M_HANDSHAKE) }
+    if (-not $tunnelOk) {
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        $state = 'unknown'
+        if ($service) { $state = $service.Status }
+        throw ((T $M_HANDSHAKE) + ' service=' + $state)
+    }
 
     $stage = 'sshd'
     Write-Host (T $M_SSH)
@@ -884,7 +921,10 @@ UseDNS no
     Write-Host ((T $M_FAIL) + $detail) -ForegroundColor Red
     Write-Host ((T $M_STAGE) + $stage) -ForegroundColor Red
     Report ($stage + ': ' + $detail)
-    Stop-WithPause $detail
+    try { Set-Clipboard -Value ($stage + ': ' + $detail) | Out-Null } catch {
+    }
+    try { Read-Host (T $M_PAUSE) } catch {
+    }
 }
 
 WINDOWS_PS
