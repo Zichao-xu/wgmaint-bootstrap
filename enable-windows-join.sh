@@ -9,6 +9,7 @@ state=/var/lib/wgmaint
 dropin=/etc/systemd/system/$service.d/short-join.conf
 module=$app/registry_windows.py
 bootstrap=$app/customer-join-windows.ps1
+launcher=$app/windows-bootstrap.ps1
 firewall=$state/firewall.nft
 systemctl is-active --quiet "$service" ||
     die '找不到正在运行的维护登记服务，请在已部署的维护 VPS 上执行。'
@@ -23,7 +24,7 @@ mapfile -t launchers < <(sed -n 's/^ExecStart=\(.*\/gunicorn .* \)registry:appli
 
 work=$(mktemp -d)
 changed=false
-files=("$module" "$bootstrap" "$dropin" "$firewall")
+files=("$module" "$bootstrap" "$dropin" "$firewall" "$launcher")
 rollback() {
     local status=$? i
     trap - EXIT
@@ -87,18 +88,42 @@ if TEMPLATE.count(MARKER) != 1:
     raise RuntimeError("invalid Windows bootstrap template")
 
 
-def public_key_pin():
-    public_key = subprocess.check_output(
-        ["/usr/bin/openssl", "x509", "-in", str(STATE / "join.crt"), "-noout", "-pubkey"],
-        timeout=3,
-    )
-    der = subprocess.check_output(
-        ["/usr/bin/openssl", "pkey", "-pubin", "-outform", "DER"], input=public_key, timeout=3,
-    )
-    return "sha256//" + base64.b64encode(hashlib.sha256(der).digest()).decode("ascii")
+BOOTSTRAP = Path(__file__).with_name("windows-bootstrap.ps1").read_bytes()
+CERTIFICATE = subprocess.check_output(
+    ["/usr/bin/openssl", "x509", "-in", str(STATE / "join.crt"), "-outform", "DER"], timeout=3,
+)
+CERTIFICATE_HASH = base64.b64encode(hashlib.sha256(CERTIFICATE).digest())
 
 
-PIN = public_key_pin()
+def origin():
+    return "https://" + config()["endpoint"].rsplit(":", 1)[0] + ":8443"
+
+
+def bootstrap(environ, start_response):
+    method = environ["REQUEST_METHOD"]
+    if method not in ("HEAD", "GET"):
+        return response(start_response, "405 Method Not Allowed")
+    body = BOOTSTRAP.replace(b"WGMAINT_BOOTSTRAP_ORIGIN", origin().encode("ascii"))
+    body = body.replace(b"WGMAINT_BOOTSTRAP_CERTIFICATE", CERTIFICATE_HASH)
+    size = len(body)
+    headers = [("Content-Type", "text/plain; charset=us-ascii"), ("Accept-Ranges", "bytes"),
+               ("Cache-Control", "no-store"), ("ETag", '"' + hashlib.sha256(body).hexdigest() + '"')]
+    status = "200 OK"
+    if method == "GET" and environ.get("HTTP_RANGE"):
+        match = re.fullmatch(r"bytes=(\d{1,10})-(\d{0,10})", environ["HTTP_RANGE"])
+        if not match:
+            return response(start_response, "400 Bad Request")
+        first = int(match[1])
+        last = min(int(match[2]), size - 1) if match[2] else size - 1
+        if first > last:
+            start_response("416 Range Not Satisfiable", [("Content-Range", f"bytes */{size}"), ("Content-Length", "0")])
+            return [b""]
+        status = "206 Partial Content"
+        headers.append(("Content-Range", f"bytes {first}-{last}/{size}"))
+        body = body[first:last + 1]
+    headers.append(("Content-Length", str(len(body))))
+    start_response(status, headers)
+    return [b"" if method == "HEAD" else body]
 
 
 def urlsafe(raw):
@@ -216,8 +241,7 @@ def download(code, package, environ, start_response):
         ])
         return environ["wsgi.file_wrapper"](handle) if "wsgi.file_wrapper" in environ else FileChunks(handle)
     data = config()
-    origin = "https://" + data["endpoint"].rsplit(":", 1)[0] + ":8443"
-    data.update(token=token, pin=PIN, origin=origin, code=code, ssh_public_key=row[1])
+    data.update(token=token, code=code, ssh_public_key=row[1])
     payload = base64.b64encode(json.dumps(data, sort_keys=True).encode("ascii"))
     return response(start_response, "200 OK", TEMPLATE.replace(MARKER, payload))
 
@@ -236,6 +260,8 @@ class FileChunks:
 def application(environ, start_response):
     path, method = environ["PATH_INFO"], environ["REQUEST_METHOD"]
     try:
+        if path == "/b":
+            return bootstrap(environ, start_response)
         if path == "/v1/windows-package":
             if method == "HEAD":
                 return response(start_response, "200 OK" if available_package() else "204 No Content")
@@ -282,7 +308,6 @@ $account = 'wgmaint-ssh'
 $taskName = 'Wgmaint OpenSSH'
 $firewall = 'Wgmaint-SSH'
 $port = 2222
-$curl = Join-Path $env:windir 'System32\curl.exe'
 $sshDirectory = Join-Path $env:windir 'System32\OpenSSH'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 
@@ -351,9 +376,7 @@ try {
     if (!(Test-Path $wg) -or !(Test-Path $wireguard)) {
         $msi = Join-Path $root 'wireguard.msi'
         try {
-            Invoke-Native $curl @('-qfksS', '--noproxy', '*', '--pinnedpubkey', $settings.pin,
-                '--connect-timeout', '8', '--max-time', '90', '--output', $msi,
-                "$($settings.origin)/w/$($settings.code)/wg")
+            $wgmaintHttp.GetPackage("/w/$($settings.code)/wg", $msi)
             if ((Get-FileHash -Algorithm SHA256 $msi).Hash -ne
                 '7bfed60ad61b785c914b38b61555a975488e1d3ec472dbfb2fcdf498fca75242') {
                 throw 'WireGuard 安装包校验失败。'
@@ -402,9 +425,7 @@ try {
         throw 'WireGuard 公钥生成失败。'
     }
     $request = @{ token = $settings.token; public_key = $publicKey } | ConvertTo-Json -Compress
-    $result = $request | & $curl -qfksS --noproxy '*' --pinnedpubkey $settings.pin --connect-timeout 8 --max-time 25 `
-        -H 'Content-Type: application/json' --data-binary '@-' "$($settings.origin)/v1/enroll"
-    if ($LASTEXITCODE -ne 0) { throw 'VPS 登记失败。请重新生成接入命令再试。' }
+    $result = $wgmaintHttp.PostJson('/v1/enroll', $request)
     $peer = $result | ConvertFrom-Json
     if ($peer.address -notmatch '^\d{1,3}(\.\d{1,3}){3}/32$' -or
         $peer.admin_ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or
@@ -516,6 +537,84 @@ PermitTunnel no
 }
 WGMAINT_WINDOWS_PS
 
+cat >"$work/windows-bootstrap.ps1" <<'WGMAINT_WINDOWS_BOOT'
+if ($t -cnotmatch '^[A-Za-z0-9_-]{22}$') { throw 'Invalid onboarding code.' }
+$origin = 'WGMAINT_BOOTSTRAP_ORIGIN'
+$certificateHash = 'WGMAINT_BOOTSTRAP_CERTIFICATE'
+if (-not ('WgmaintHttps' -as [type])) {
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+
+public sealed class WgmaintHttps
+{
+    private readonly Uri origin;
+    private readonly string certificateHash;
+
+    public WgmaintHttps(string origin, string certificateHash)
+    {
+        this.origin = new Uri(origin);
+        this.certificateHash = certificateHash;
+    }
+
+    private byte[] Request(string path, string json, int limit)
+    {
+        if (!path.StartsWith("/", StringComparison.Ordinal) || path.StartsWith("//", StringComparison.Ordinal))
+            throw new ArgumentException("Invalid relative path.", "path");
+
+        var request = (HttpWebRequest)WebRequest.Create(new Uri(origin, path));
+        request.AllowAutoRedirect = false;
+        request.Proxy = null;
+        request.Timeout = 25000;
+        request.ReadWriteTimeout = 25000;
+        request.ServerCertificateValidationCallback = (sender, certificate, chain, errors) =>
+        {
+            if (certificate == null) return false;
+            using (var sha = SHA256.Create())
+                return Convert.ToBase64String(sha.ComputeHash(certificate.GetRawCertData())) == certificateHash;
+        };
+        if (json != null)
+        {
+            byte[] data = Encoding.UTF8.GetBytes(json);
+            request.Method = "POST";
+            request.ContentType = "application/json";
+            request.ContentLength = data.Length;
+            using (Stream body = request.GetRequestStream()) body.Write(data, 0, data.Length);
+        }
+        using (var response = (HttpWebResponse)request.GetResponse())
+        {
+            if (response.StatusCode != HttpStatusCode.OK || response.ContentLength < 1 ||
+                response.ContentLength > limit)
+                throw new IOException("Invalid HTTPS response.");
+            using (var input = response.GetResponseStream())
+            using (var output = new MemoryStream((int)response.ContentLength))
+            {
+                byte[] buffer = new byte[65536];
+                int read;
+                while ((read = input.Read(buffer, 0, buffer.Length)) != 0)
+                {
+                    if (output.Length + read > limit) throw new IOException("Response too large.");
+                    output.Write(buffer, 0, read);
+                }
+                if (output.Length != response.ContentLength) throw new IOException("Incomplete HTTPS response.");
+                return output.ToArray();
+            }
+        }
+    }
+
+    public string GetScript(string path) { return Encoding.UTF8.GetString(Request(path, null, 65536)); }
+    public string PostJson(string path, string json) { return Encoding.UTF8.GetString(Request(path, json, 65536)); }
+    public void GetPackage(string path, string filename) { File.WriteAllBytes(filename, Request(path, null, 3293184)); }
+}
+'@
+}
+$wgmaintHttp = [WgmaintHttps]::new($origin, $certificateHash)
+& ([scriptblock]::Create($wgmaintHttp.GetScript("/w/$t")))
+WGMAINT_WINDOWS_BOOT
+
 python3 - "$work/registry_windows.py" <<'WGMAINT_CHECK_PY'
 from pathlib import Path
 import sys
@@ -538,6 +637,7 @@ put() {
 changed=true
 put "$work/registry_windows.py" "$module"
 put "$work/customer-join-windows.ps1" "$bootstrap"
+put "$work/windows-bootstrap.ps1" "$launcher"
 put "$work/short-join.conf" "$dropin"
 install -m 0600 "$work/firewall.nft" "$firewall.wgmaint-new"
 mv -f -- "$firewall.wgmaint-new" "$firewall"
