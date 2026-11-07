@@ -156,7 +156,7 @@ def register_code(environ, start_response):
         r"(?:ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) [A-Za-z0-9+/=]{16,3500}", key
     ):
         return response(start_response, "400 Bad Request")
-    code = urlsafe(hashlib.sha256(b"wgmaint-windows-code:" + token.encode("ascii")).digest()[:16])
+    code = urlsafe(hashlib.sha256(b"wgmaint-windows-code:" + token.encode("ascii")).digest()[:12])
     binding = digest(enrollment_token(code))
     with closing(db_connect()) as db, db:
         db.execute("BEGIN IMMEDIATE")
@@ -275,7 +275,7 @@ def application(environ, start_response):
                 return register_code(environ, start_response)
             return response(start_response, "405 Method Not Allowed")
         if path.startswith("/w/"):
-            match = re.fullmatch(r"/w/([A-Za-z0-9_-]{22})(?:/(wg))?", path)
+            match = re.fullmatch(r"/w/([A-Za-z0-9_-]{16}|[A-Za-z0-9_-]{22})(?:/(wg))?", path)
             if not match:
                 return response(start_response, "404 Not Found")
             if method != "GET":
@@ -538,7 +538,7 @@ PermitTunnel no
 WGMAINT_WINDOWS_PS
 
 cat >"$work/windows-bootstrap.ps1" <<'WGMAINT_WINDOWS_BOOT'
-if ($t -cnotmatch '^[A-Za-z0-9_-]{22}$') { throw 'Invalid onboarding code.' }
+if ($t -cnotmatch '^(?:[A-Za-z0-9_-]{16}|[A-Za-z0-9_-]{22})$') { throw 'Invalid onboarding code.' }
 $origin = 'WGMAINT_BOOTSTRAP_ORIGIN'
 $certificateHash = 'WGMAINT_BOOTSTRAP_CERTIFICATE'
 if (-not ('WgmaintHttps' -as [type])) {
@@ -611,8 +611,12 @@ public sealed class WgmaintHttps
 }
 '@
 }
-$wgmaintHttp = [WgmaintHttps]::new($origin, $certificateHash)
-& ([scriptblock]::Create($wgmaintHttp.GetScript("/w/$t")))
+try {
+    $wgmaintHttp = [WgmaintHttps]::new($origin, $certificateHash)
+    & ([scriptblock]::Create($wgmaintHttp.GetScript("/w/$t")))
+} finally {
+    [void](Read-Host)
+}
 WGMAINT_WINDOWS_BOOT
 
 python3 - "$work/registry_windows.py" <<'WGMAINT_CHECK_PY'
